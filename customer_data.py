@@ -76,7 +76,12 @@ def main():
         print("  orders     — list Stripe payment intents")
         sys.exit(1)
     cmd = sys.argv[1].lower()
-    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+    limit = 10
+    if len(sys.argv) > 2:
+        try:
+            limit = int(sys.argv[2])
+        except ValueError:
+            print("Note: invalid limit, using 10", file=sys.stderr)
     limit = min(max(limit, 1), 100)
     if cmd == "customers":
         list_customers(limit)

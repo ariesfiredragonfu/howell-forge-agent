@@ -75,3 +75,17 @@ python3 customer_data.py orders [limit]
 - `customers` — list Stripe customers (name, email)
 - `orders` — list payment intents (amount, status, customer)
 - Optional limit (default 10, max 100)
+
+---
+
+## Customer Service Agent
+
+**Usage:**
+```bash
+python3 customer_service.py lookup <email>
+python3 customer_service.py faq <topic>
+```
+
+- **lookup** — find customer by email and list their orders (from Stripe)
+- **faq** — hours, contact, about (canned responses)
+- Requires `~/.config/cursor-stripe-secret-key`
