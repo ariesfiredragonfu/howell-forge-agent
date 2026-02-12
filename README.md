@@ -26,3 +26,16 @@ See `~/project_docs/howell-forge-website-log.md` for the full plan.
 ### Self-healing loop
 
 Monitor and Security report to the log file. Cursor reads, fixes, pushes to GitHub, redeploys.
+
+---
+
+## Monitor Agent
+
+**Usage:**
+```bash
+python3 monitor.py
+```
+
+- Checks `https://howell-forge.com`
+- On failure: appends to `~/project_docs/howell-forge-website-log.md` with EMERGENCY or HIGH
+- Exit 0 = OK, exit 1 = alert written
