@@ -127,7 +127,7 @@ def main() -> int:
         if stripe_msg != "skipped (no key)":
             parts.append(f"Stripe {stripe_msg}")
         parts.append(f"SSL {ssl_msg}")
-        print(f"Monitor: {BASE_URL} OK ({chr(44).join(parts)})")
+        print(f"Monitor: {BASE_URL} OK ({', '.join(parts)})")
         return 0
     severity = "EMERGENCY" if any("500" in f or "Connection" in f.lower() for f in failures) else "HIGH"
     msg = "; ".join(failures)
