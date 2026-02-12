@@ -58,4 +58,20 @@ python3 security.py
 - On failure: appends to `~/project_docs/howell-forge-website-log.md` with HIGH
 - Exit 0 = OK, exit 1 = alert written
 
-**Note:** Missing headers can be added via `.htaccess` in the website repo. Security headers were added to fix the initial finding.
+**Note:** Missing headers can be added via `.htaccess` in the website repo (e.g. `Header set X-Content-Type-Options "nosniff"`).
+
+---
+
+## Customer Data Agent
+
+**Usage:**
+```bash
+python3 customer_data.py customers [limit]
+python3 customer_data.py orders [limit]
+```
+
+- Fetches customers and payment intents (orders) from Stripe
+- Requires `~/.config/cursor-stripe-secret-key`
+- `customers` — list Stripe customers (name, email)
+- `orders` — list payment intents (amount, status, customer)
+- Optional limit (default 10, max 100)
