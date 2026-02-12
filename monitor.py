@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Monitor Agent — Layer 1
-Checks site health. On failure, appends to the log file.
+Checks site health (uptime, latency). On failure, appends to the log file.
 """
 
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -12,23 +13,26 @@ from pathlib import Path
 LOG_PATH = Path.home() / "project_docs" / "howell-forge-website-log.md"
 BASE_URL = "https://howell-forge.com"
 URLS_TO_CHECK = ["/", "/about", "/contact"]
+LATENCY_THRESHOLD_SEC = 5.0  # Alert if response takes longer than this
 
 
 def check_site(url: str):
-    """Returns (ok, message)."""
+    """Returns (ok, message, latency_sec). Latency is None on failure."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Howell-Forge-Monitor/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        start = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            latency = time.perf_counter() - start
             code = resp.getcode()
             if 200 <= code < 300:
-                return True, f"OK ({code})"
-            return False, f"HTTP {code}"
+                return True, f"OK ({code})", latency
+            return False, f"HTTP {code}", latency
     except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}"
+        return False, f"HTTP {e.code}", None
     except urllib.error.URLError as e:
-        return False, f"Connection error: {e.reason}"
+        return False, f"Connection error: {e.reason}", None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
 def append_log(severity: str, message: str) -> None:
@@ -53,9 +57,11 @@ def main() -> int:
     failures = []
     for path in URLS_TO_CHECK:
         url = BASE_URL.rstrip("/") + path
-        ok, message = check_site(url)
+        ok, message, latency = check_site(url)
         if not ok:
             failures.append(f"{path or '/'}: {message}")
+        elif latency is not None and latency > LATENCY_THRESHOLD_SEC:
+            failures.append(f"{path or '/'}: slow ({latency:.1f}s > {LATENCY_THRESHOLD_SEC}s)")
     if not failures:
         print(f"Monitor: {BASE_URL} OK (all {len(URLS_TO_CHECK)} pages)")
         return 0
