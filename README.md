@@ -13,8 +13,9 @@ See `~/project_docs/howell-forge-website-log.md` for the full plan.
 1. **Monitor** (foundation) — site health, order pipeline, Stripe
 2. **Customer Data** — customer/order knowledge
 3. **Customer Service** — FAQs, inquiries, triage
-4. **Marketing** — SEO, traffic, outreach
-5. **Security** — protection, vuln checks
+4. **Shop/Factory Manager** — order flow to shop, production stages
+5. **Marketing** — SEO, traffic, outreach
+6. **Security** — protection, vuln checks
 
 ### Layers
 
@@ -66,8 +67,8 @@ python3 security.py
 
 **Usage:**
 ```bash
-python3 customer_data.py customers [limit]
-python3 customer_data.py orders [limit]
+python3 customer_data.py customers 10
+python3 customer_data.py orders 10
 ```
 
 - Fetches customers and payment intents (orders) from Stripe
@@ -82,10 +83,23 @@ python3 customer_data.py orders [limit]
 
 **Usage:**
 ```bash
-python3 customer_service.py lookup <email>
-python3 customer_service.py faq <topic>
+python3 customer_service.py lookup customer@example.com
+python3 customer_service.py faq hours
 ```
 
 - **lookup** — find customer by email and list their orders (from Stripe)
-- **faq** — hours, contact, about (canned responses)
+- **faq** — use: `hours`, `contact`, or `about`
 - Requires `~/.config/cursor-stripe-secret-key`
+
+---
+
+## Shop/Factory Manager Agent (stub)
+
+**Usage:**
+```bash
+python3 shop_manager.py
+```
+
+- **Current:** Stub — prints readiness message
+- **Future:** Order flow from Stripe → shop queue → production stages → ship → deliver
+- See `SHOP_MANAGER_FUTURE.md` for research and structure
