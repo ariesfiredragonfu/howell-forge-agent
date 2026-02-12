@@ -10,7 +10,8 @@ from datetime import datetime
 from pathlib import Path
 
 LOG_PATH = Path.home() / "project_docs" / "howell-forge-website-log.md"
-URL = "https://howell-forge.com"
+BASE_URL = "https://howell-forge.com"
+URLS_TO_CHECK = ["/", "/about", "/contact"]
 
 
 def check_site(url: str):
@@ -49,13 +50,19 @@ def append_log(severity: str, message: str) -> None:
 
 
 def main() -> int:
-    ok, message = check_site(URL)
-    if ok:
-        print(f"Monitor: {URL} {message}")
+    failures = []
+    for path in URLS_TO_CHECK:
+        url = BASE_URL.rstrip("/") + path
+        ok, message = check_site(url)
+        if not ok:
+            failures.append(f"{path or '/'}: {message}")
+    if not failures:
+        print(f"Monitor: {BASE_URL} OK (all {len(URLS_TO_CHECK)} pages)")
         return 0
-    severity = "EMERGENCY" if "500" in message or "Connection" in message.lower() else "HIGH"
-    append_log(severity, f"Site check failed — {message}")
-    print(f"Monitor: ALERT — {URL} {message} (wrote to log)")
+    severity = "EMERGENCY" if any("500" in f or "Connection" in f.lower() for f in failures) else "HIGH"
+    msg = "; ".join(failures)
+    append_log(severity, f"Site check failed — {msg}")
+    print(f"Monitor: ALERT — {msg} (wrote to log)")
     return 1
 
 
