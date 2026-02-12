@@ -35,6 +35,22 @@ Monitor verifies each stage
 
 ---
 
+## Messaging (Future)
+
+**To you (owner):**
+- Notify when new order needs shop handoff
+- Alert when order is stuck or delayed
+- Daily/weekly summaries
+- Channel: Telegram (Zapier webhook), email, or both
+
+**To factory / shop floor:**
+- Eventually: factory manager person, robots, machines
+- New job arrives → message shop
+- Stage updates → notify relevant party
+- Format/channel TBD (dashboard, SMS, in-shop display, M2M API)
+
+---
+
 ## Integration Options (Future)
 
 ### Stripe → Shop
@@ -65,6 +81,7 @@ Options for small metal fab:
 3. **Track:** Know stage of each order (received, in progress, complete, shipped)
 4. **Report:** Feed status to Monitor for pipeline health
 5. **Alert:** Flag orders stuck or delayed
+6. **Message:** Notify you; eventually notify factory manager, robots, machines
 
 ---
 
@@ -72,6 +89,7 @@ Options for small metal fab:
 
 - Stripe key (already used by Customer Data)
 - Shop system/API (to be chosen)
+- Messaging: Telegram/Zapier (for you), TBD for factory
 - Possibly: shipping API (tracking), email (notifications)
 
 ---
