@@ -36,6 +36,6 @@ Monitor and Security report to the log file. Cursor reads, fixes, pushes to GitH
 python3 monitor.py
 ```
 
-- Checks `https://howell-forge.com`
+- Checks `https://howell-forge.com` (/, /about, /contact)
 - On failure: appends to `~/project_docs/howell-forge-website-log.md` with EMERGENCY or HIGH
 - Exit 0 = OK, exit 1 = alert written
