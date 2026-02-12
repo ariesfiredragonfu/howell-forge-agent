@@ -37,5 +37,7 @@ python3 monitor.py
 ```
 
 - Checks `https://howell-forge.com` (/, /about, /contact)
+- **Uptime:** alerts on HTTP errors, connection failures
+- **Latency:** alerts if any page takes > 5s to respond
 - On failure: appends to `~/project_docs/howell-forge-website-log.md` with EMERGENCY or HIGH
 - Exit 0 = OK, exit 1 = alert written
