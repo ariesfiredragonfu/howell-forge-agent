@@ -40,5 +40,22 @@ python3 monitor.py
 - **Uptime:** alerts on HTTP errors, connection failures
 - **Latency:** alerts if any page takes > 5s to respond
 - **Stripe API:** calls balance endpoint; requires `~/.config/cursor-stripe-secret-key` (skips if missing)
+- **SSL certificate:** checks validity and expiration; alerts if expired or expiring within 14 days
 - On failure: appends to `~/project_docs/howell-forge-website-log.md` with EMERGENCY or HIGH
 - Exit 0 = OK, exit 1 = alert written
+
+---
+
+## Security Agent
+
+**Usage:**
+```bash
+python3 security.py
+```
+
+- **HTTPS redirect:** HTTP must redirect to HTTPS
+- **Security headers:** Checks for X-Content-Type-Options, X-Frame-Options or Content-Security-Policy
+- On failure: appends to `~/project_docs/howell-forge-website-log.md` with HIGH
+- Exit 0 = OK, exit 1 = alert written
+
+**Note:** Missing headers can be added via `.htaccess` in the website repo. Security headers were added to fix the initial finding.
