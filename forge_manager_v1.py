@@ -419,28 +419,117 @@ def _validate_gcode(gcode_path: Path) -> dict:
     return {"ok": ok, "issues": issues, "raw": output}
 
 
+# ─── Step 4b: Blender headless preview render ────────────────────────────────
+
+_BLENDER_RENDER_SCRIPT = """\
+import bpy, math, sys
+
+stl_path = {stl!r}
+out_dir  = {out!r}
+
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
+
+bpy.ops.import_mesh.stl(filepath=stl_path)
+obj = bpy.context.selected_objects[0]
+bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+obj.location = (0, 0, 0)
+
+dims  = obj.dimensions
+scale = 2.0 / max(dims) if max(dims) > 0 else 1.0
+obj.scale = (scale, scale, scale)
+bpy.ops.object.transform_apply(scale=True)
+
+mat = bpy.data.materials.new("Steel")
+mat.diffuse_color = (0.55, 0.57, 0.62, 1.0)
+obj.data.materials.append(mat)
+
+bpy.ops.object.light_add(type='SUN', location=(3, 3, 5))
+bpy.context.object.data.energy = 3.0
+
+scene = bpy.context.scene
+scene.render.resolution_x = 800
+scene.render.resolution_y = 600
+scene.render.image_settings.file_format = 'PNG'
+scene.render.engine = 'BLENDER_EEVEE'
+
+cam_data = bpy.data.cameras.new("Cam")
+cam_obj  = bpy.data.objects.new("Cam", cam_data)
+scene.collection.objects.link(cam_obj)
+scene.camera = cam_obj
+
+def render_view(name, loc, rot_deg):
+    cam_obj.location = loc
+    cam_obj.rotation_euler = [math.radians(r) for r in rot_deg]
+    scene.render.filepath = f"{{out_dir}}/preview_{{name}}.png"
+    bpy.ops.render.render(write_still=True)
+    print(f"[RENDER] {{name}} → {{scene.render.filepath}}")
+
+render_view("perspective", (3.5, -3.5, 2.5), (65, 0, 45))
+render_view("top",         (0,   0,   5.0),  (0,  0, 0))
+render_view("front",       (0,  -4.0, 0.5),  (90, 0, 0))
+print("[RENDER] done")
+"""
+
+
+def _render_previews(stl_path: Path, output_dir: Path) -> list[Path]:
+    """
+    Use Blender headless to render perspective / top / front PNG previews.
+    Returns list of PNG paths, or empty list if Blender is unavailable.
+    """
+    import shutil
+    blender = shutil.which("blender")
+    if not blender:
+        print("[FORGE] Blender not found — skipping preview render")
+        return []
+
+    script_path = output_dir / "_render_script.py"
+    script_path.write_text(
+        _BLENDER_RENDER_SCRIPT.format(stl=str(stl_path), out=str(output_dir))
+    )
+
+    print("[FORGE] Rendering STL previews via Blender headless …")
+    result = subprocess.run(
+        [blender, "--background", "--python", str(script_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    pngs = sorted(output_dir.glob("preview_*.png"))
+    if pngs:
+        print(f"[FORGE] ✓ Preview renders ready ({len(pngs)} images):")
+        for p in pngs:
+            print(f"        {p}")
+    else:
+        print(f"[FORGE] Blender render produced no output — check {output_dir}/_render_script.py")
+        if result.stderr:
+            print(result.stderr[-500:])
+    return pngs
+
+
 # ─── Step 5: Human visual check ──────────────────────────────────────────────
 
 def _human_review(stl_path: Path, gcode_path: Path, validation: dict) -> bool:
     """
-    Pause for human inspection.
-    Prints file paths so the operator can open them, then prompts Y/N.
+    Render STL previews, then pause for human Y/N approval.
     Returns True if approved.
     """
+    output_dir = stl_path.parent
+    pngs = _render_previews(stl_path, output_dir)
+
     print()
     print("=" * 60)
     print("  FORGE MANAGER V1 — HUMAN REVIEW REQUIRED")
     print("=" * 60)
     print()
-    print("  Open the following files and inspect before approving:")
+    if pngs:
+        print("  Preview images (open in Cursor or any image viewer):")
+        for p in pngs:
+            print(f"    {p}")
+    else:
+        print(f"  STL (3D model):  {stl_path}")
+        print(f"  (open with:  freecad {stl_path})")
     print()
-    print(f"  STL (3D preview):   {stl_path}")
-    print(f"  G-code:             {gcode_path}")
-    print()
-    print("  Commands:")
-    print(f"    blender {stl_path}              (fastest — drag-rotate to inspect)")
-    print(f"    freecad {stl_path}              (FreeCAD GUI — may take 10-20s to load)")
-    print(f"    cat {gcode_path}")
+    print(f"  G-code:  {gcode_path}")
+    print(f"  (view:   cat {gcode_path})")
     print()
 
     if not validation["ok"]:
