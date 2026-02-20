@@ -274,6 +274,111 @@ def test_publish_order_paid_facade():
     set_backend(SQLiteBackend())   # restore for subsequent tests
 
 
+# ─── Test 8: end-to-end pub/sub roundtrip ────────────────────────────────────
+
+def test_pubsub_roundtrip():
+    """
+    Full roundtrip: eliza_memory.publish_order_paid() → subscriber receives
+    and validates the envelope.
+
+    Why not just call Redis.publish() directly?
+    The test must exercise the real publish path (eliza_memory →
+    RedisBackend.publish_order_event) so it catches any future mismatch
+    between the producer's key name / format and what a subscriber parses.
+
+    Setup
+    -----
+    1. Seed a PAID order in Redis so _react_to_paid's idempotency check would
+       pass if it ran (we don't invoke the full reaction here — that requires
+       mocking Telegram; it is covered in test_publish_order_paid_facade).
+    2. Start a subscriber on the channel BEFORE publishing to guarantee the
+       message is not lost (Redis pub/sub does not buffer).
+    3. Call publish_order_paid() — the actual production code path.
+    4. Wait up to 3 seconds for the message with asyncio.wait_for.
+    5. Assert every field of the received envelope matches the spec.
+    """
+    REDIS_URL = "redis://localhost:6379/0"
+
+    if not _redis_reachable(REDIS_URL):
+        print(f"\n[8] Pub/sub roundtrip [{SKIP}] — Redis not reachable")
+        _results.append(("Pub/sub roundtrip", "SKIP"))
+        return
+
+    print("\n[8] Pub/sub roundtrip — publish_order_paid → subscriber receives")
+
+    import asyncio
+    import eliza_memory as em
+
+    ORDER_ID = f"ROUNDTRIP-{uuid.uuid4().hex[:8].upper()}"
+    AMOUNT   = 99.99
+
+    # Seed a PAID order in Redis so the envelope's order_id is known
+    redis_db = RedisBackend(url=REDIS_URL)
+    set_backend(redis_db)
+    em.upsert_order(
+        order_id      = ORDER_ID,
+        status        = "PAID",
+        customer_email= "roundtrip@test.com",
+        amount_usd    = AMOUNT,
+        kaito_tx_id   = "ktx_roundtrip_test",
+    )
+
+    async def _roundtrip() -> dict:
+        """
+        Subscribe, publish, receive — all in one async scope.
+
+        Subscribing before publishing is the only race-free ordering: Redis
+        pub/sub delivers messages only to subscribers that are connected at
+        the moment of publish; there is no buffering.
+        """
+        from redis.asyncio import Redis as ARedis
+
+        received: dict = {}
+
+        async with ARedis.from_url(REDIS_URL, decode_responses=True) as sub_client:
+            async with sub_client.pubsub() as pubsub:
+                channel = f"{RedisBackend.NAMESPACE}order_events"
+                await pubsub.subscribe(channel)
+
+                # Drain the subscription-confirmation message first
+                async for msg in pubsub.listen():
+                    if msg.get("type") == "subscribe":
+                        break   # channel confirmed — safe to publish now
+
+                # Publish via the production code path (not a raw redis.publish call)
+                em.publish_order_paid(ORDER_ID, {"amount_usd": AMOUNT, "tx_hash": "0xTEST"})
+
+                # Wait up to 3 s for the message to arrive
+                async def _recv():
+                    async for msg in pubsub.listen():
+                        if msg.get("type") == "message":
+                            return json.loads(msg["data"])
+
+                received = await asyncio.wait_for(_recv(), timeout=3.0)
+
+        return received
+
+    payload = asyncio.run(_roundtrip())
+
+    # ── Assertions ──────────────────────────────────────────────────────────
+    _check("Received a non-empty payload",        bool(payload))
+    _check("event_type is 'paid'",                payload.get("type") == "paid")
+    _check("order_id matches",                    payload.get("order_id") == ORDER_ID)
+
+    data = payload.get("data", {})
+    _check("data.amount_usd matches",             data.get("amount_usd") == AMOUNT)
+    _check("data.tx_hash present",                data.get("tx_hash") == "0xTEST")
+
+    ts_str = payload.get("timestamp", "")
+    try:
+        parsed_ts = datetime.fromisoformat(ts_str)
+        _check("timestamp is ISO 8601 with tz offset", parsed_ts.tzinfo is not None, ts_str)
+    except ValueError:
+        _check("timestamp is ISO 8601 with tz offset", False, repr(ts_str))
+
+    set_backend(SQLiteBackend())   # restore default
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -285,6 +390,7 @@ def main():
         sqlite_oid = test_sqlite_write_read()
         test_redis_swap(sqlite_oid)
         test_publish_order_paid_facade()
+        test_pubsub_roundtrip()
     except AssertionError:
         pass  # already printed, continue to summary
 
