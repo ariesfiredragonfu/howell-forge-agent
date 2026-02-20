@@ -278,6 +278,70 @@ def add_pr_comment(pr_number: int, body: str) -> dict:
     )
 
 
+# ─── Occurrence counter (dedup update) ────────────────────────────────────────
+
+_OCCURRENCE_MARKER = "<!-- occurrence-counter -->"
+
+
+def update_pr_occurrence(
+    pr_number: int,
+    occurrence_count: int,
+    first_seen: str,
+) -> None:
+    """
+    Update the PR body's occurrence counter banner in-place.
+
+    Called by fortress_watcher when a duplicate event (same sha256 dedup key
+    within the 5-minute window) hits an already-open PR.  Instead of opening
+    a new PR we increment a visible counter so the reviewer knows how many
+    times the event fired.
+
+    The banner looks like:
+        <!-- occurrence-counter -->
+        > 🔄 **Event has occurred 3×** (first seen: 2026-02-20T17:00:00Z)
+    """
+    try:
+        pr = _api("GET", f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
+    except GitHubError:
+        return
+
+    current_body = pr.get("body") or ""
+    new_banner = (
+        f"{_OCCURRENCE_MARKER}\n"
+        f"> 🔄 **Event has occurred {occurrence_count}×** "
+        f"(first seen: {first_seen})\n"
+    )
+
+    if _OCCURRENCE_MARKER in current_body:
+        # Replace existing banner (everything up to the next blank line / section)
+        lines = current_body.split("\n")
+        new_lines: list[str] = []
+        skip = False
+        for line in lines:
+            if _OCCURRENCE_MARKER in line:
+                new_lines.append(new_banner.rstrip())
+                skip = True
+                continue
+            if skip:
+                # Skip the old "🔄" line then resume normal content
+                skip = False
+                continue
+            new_lines.append(line)
+        new_body = "\n".join(new_lines)
+    else:
+        new_body = new_banner + "\n" + current_body
+
+    try:
+        _api(
+            "PATCH",
+            f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}",
+            {"body": new_body},
+        )
+        print(f"[GitHub] Updated PR #{pr_number} occurrence counter → {occurrence_count}×")
+    except GitHubError:
+        pass
+
+
 # ─── Error ────────────────────────────────────────────────────────────────────
 
 class GitHubError(Exception):

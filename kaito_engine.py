@@ -23,6 +23,7 @@ blockchain APIs.
 
 import hashlib
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +41,146 @@ _DEFAULT_CONFIG: dict = {
     "network": "polygon",
     "dev_mode": True,
 }
+
+# ─── Circuit Breaker ──────────────────────────────────────────────────────────
+#
+# States:   CLOSED    — normal operation
+#           OPEN      — all calls rejected; Telegram alert + fortress log entry
+#           HALF_OPEN — probe mode; HALF_OPEN_PROBES successes → CLOSED,
+#                       any failure → back to OPEN
+#
+# Trip on:  429 (rate limit), 500/502/503/504 (server errors), 0 (connection)
+# Ignore:   400 (bad request), 401/403 (auth — handled by security handshake),
+#           404, 409 (conflict) — these are terminal logic errors, not infra
+
+_CB_TRIP_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+_CB_TERMINAL_CODES: frozenset[int] = frozenset({400, 401, 403, 404, 409, 410})
+
+_CB_STATE_FILE    = Path.home() / ".config" / "kaito-cb-state.json"
+_CB_FAILURE_THRESHOLD  = 3    # consecutive trippable failures to trip
+_CB_RECOVERY_TIMEOUT   = 120  # seconds in OPEN before HALF_OPEN probe
+_CB_HALF_OPEN_PROBES   = 3    # consecutive successes needed to re-CLOSE
+_CB_FORTRESS_LOG       = Path.home() / "project_docs" / "fortress_errors.log"
+
+
+def _cb_load() -> dict:
+    if _CB_STATE_FILE.exists():
+        try:
+            return json.loads(_CB_STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {
+        "state": "CLOSED",
+        "consecutive_failures": 0,
+        "opened_at": None,
+        "probe_successes": 0,
+    }
+
+
+def _cb_save(state: dict) -> None:
+    _CB_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CB_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def _cb_is_open() -> bool:
+    """
+    Returns True if calls should be blocked.
+    Transparently transitions OPEN → HALF_OPEN when recovery timeout elapses.
+    """
+    s = _cb_load()
+    if s["state"] == "OPEN":
+        opened_at = s.get("opened_at")
+        if opened_at and (time.time() - opened_at) >= _CB_RECOVERY_TIMEOUT:
+            s["state"] = "HALF_OPEN"
+            s["probe_successes"] = 0
+            _cb_save(s)
+            print(f"[CB] HALF_OPEN — allowing {_CB_HALF_OPEN_PROBES} probe requests")
+            return False
+        return True
+    return False
+
+
+def _cb_record_success() -> None:
+    s = _cb_load()
+    if s["state"] == "HALF_OPEN":
+        s["probe_successes"] = s.get("probe_successes", 0) + 1
+        if s["probe_successes"] >= _CB_HALF_OPEN_PROBES:
+            s.update({"state": "CLOSED", "consecutive_failures": 0,
+                       "opened_at": None, "probe_successes": 0})
+            print(f"[CB] CLOSED — {_CB_HALF_OPEN_PROBES} probes succeeded")
+    elif s["state"] == "CLOSED":
+        s["consecutive_failures"] = 0
+    _cb_save(s)
+
+
+def _cb_record_failure(status_code: int) -> None:
+    """Update circuit state for a failed request.  Terminal codes are no-ops."""
+    if status_code in _CB_TERMINAL_CODES:
+        return
+    if status_code not in _CB_TRIP_CODES and status_code != 0:
+        return
+
+    s = _cb_load()
+
+    if s["state"] == "HALF_OPEN":
+        s.update({"state": "OPEN", "opened_at": time.time(), "probe_successes": 0})
+        print(f"[CB] OPEN — probe failed (code={status_code}), resetting recovery timer")
+        _cb_save(s)
+        _cb_on_open(status_code)
+        return
+
+    s["consecutive_failures"] = s.get("consecutive_failures", 0) + 1
+    if (s["consecutive_failures"] >= _CB_FAILURE_THRESHOLD
+            and s["state"] != "OPEN"):
+        s.update({"state": "OPEN", "opened_at": time.time()})
+        print(
+            f"[CB] OPEN — tripped after {s['consecutive_failures']} "
+            f"consecutive failures (code={status_code})"
+        )
+        _cb_save(s)
+        _cb_on_open(status_code)
+        return
+
+    _cb_save(s)
+
+
+def _cb_on_open(status_code: int) -> None:
+    """Side-effects when the circuit trips OPEN: alert + fortress log entry."""
+    msg = (
+        f"🔴 [CIRCUIT BREAKER OPEN] Kaito API unreachable. "
+        f"{_CB_FAILURE_THRESHOLD} consecutive failures (last code={status_code}). "
+        f"Recovery probe in {_CB_RECOVERY_TIMEOUT}s. "
+        f"A Fix Proposal PR will be raised for human review — do NOT auto-switch rails."
+    )
+    try:
+        from notifications import send_telegram_alert
+        send_telegram_alert(msg)
+    except Exception:
+        pass
+
+    # Write directly to fortress_errors.log so fortress_watcher picks it up.
+    # Avoids importing eliza_actions (which imports kaito_engine → circular).
+    entry = json.dumps({
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "action": "CIRCUIT_BREAKER",
+        "agent": "KAITO_ENGINE",
+        "order_id": None,
+        "error_type": "CircuitBreakerOpen",
+        "error_code": status_code,
+        "endpoint": "/kaito/circuit-breaker",
+        "detail": msg,
+    })
+    try:
+        _CB_FORTRESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_CB_FORTRESS_LOG, "a") as f:
+            f.write(entry + "\n")
+    except OSError:
+        pass
+
+
+def get_circuit_state() -> dict:
+    """Return the current circuit breaker state (for health checks / status pages)."""
+    return _cb_load()
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -71,8 +212,25 @@ def _kaito_request(
 ) -> dict:
     """
     Perform an authenticated request to the Kaito API.
-    Raises KaitoAPIError on HTTP errors or connection failures.
+
+    Checks the circuit breaker before every call:
+      - OPEN      → raises KaitoAPIError immediately (no network call)
+      - HALF_OPEN → allows probe call through
+      - CLOSED    → normal operation
+
+    Updates the circuit breaker on success or failure. Only 429 and 5xx
+    responses trip the breaker; 400/409 (terminal logic errors) and
+    401/403 (auth errors handled by the Security Handshake) are ignored.
+
+    Raises KaitoAPIError on HTTP errors, connection failures, or open circuit.
     """
+    if _cb_is_open():
+        raise KaitoAPIError(
+            503,
+            f"Kaito circuit breaker OPEN — calls suspended for {_CB_RECOVERY_TIMEOUT}s",
+            endpoint=path,
+        )
+
     url = cfg["api_url"].rstrip("/") + path
     data = json.dumps(payload).encode("utf-8") if payload else None
     headers = {
@@ -83,14 +241,18 @@ def _kaito_request(
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            result = json.loads(resp.read().decode())
+            _cb_record_success()
+            return result
     except urllib.error.HTTPError as e:
+        _cb_record_failure(e.code)
         raise KaitoAPIError(
             e.code,
             f"Kaito API HTTP {e.code} on {path}",
             endpoint=path,
         ) from e
     except urllib.error.URLError as e:
+        _cb_record_failure(0)
         raise KaitoAPIError(
             0,
             f"Kaito connection error on {path}: {e.reason}",
@@ -253,13 +415,16 @@ def trigger_status_refresh(kaito_tx_id: str, order_id: Optional[str] = None) -> 
 # ─── Errors ───────────────────────────────────────────────────────────────────
 
 class KaitoAPIError(Exception):
-    """Raised when the Kaito API returns an error or is unreachable."""
+    """Raised when the Kaito API returns an error, is unreachable, or the circuit is open."""
 
     def __init__(self, status_code: int, message: str, endpoint: Optional[str] = None):
         super().__init__(message)
         self.status_code = status_code
         self.endpoint = endpoint
         self.is_auth_error = status_code in (401, 403)
+        self.is_circuit_open = status_code == 503 and "circuit breaker" in message.lower()
+        self.is_rate_limit = status_code == 429
+        self.is_server_error = status_code in (500, 502, 503, 504) and not self.is_circuit_open
 
     def __repr__(self) -> str:
         return f"KaitoAPIError(status={self.status_code}, endpoint={self.endpoint})"

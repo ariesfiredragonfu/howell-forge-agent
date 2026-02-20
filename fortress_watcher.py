@@ -25,6 +25,7 @@ State file: ~/project_docs/.fortress_watcher_state.json
 
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import sys
@@ -33,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import github_integration
 import security_agent
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -137,39 +139,120 @@ def read_new_entries(state: dict, replay: bool = False) -> list[dict]:
     return entries
 
 
-# ─── Deduplication ────────────────────────────────────────────────────────────
+# ─── Deduplication (Grok refinement: sha256 on 5-min bucket) ─────────────────
+#
+# dedup_key = sha256( detail_text + 5-minute-floored-timestamp )
+#
+# When a duplicate arrives within the DEDUP_WINDOW_SEC window:
+#   - Increment occurrence_count in state["dedup_tracker"][key]
+#   - Update the existing PR body with the new count (no new PR)
+#   - Do NOT dispatch to the Security Agent again
+
+def _five_min_bucket(ts_str: Optional[str]) -> str:
+    """Floor an ISO timestamp string to the nearest 5-minute boundary."""
+    if not ts_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        floored = dt.replace(minute=(dt.minute // 5) * 5, second=0, microsecond=0)
+        return floored.isoformat()
+    except (ValueError, AttributeError):
+        return ""
+
 
 def _dedup_key(entry: dict) -> str:
-    return f"{entry.get('action')}:{entry.get('error_code')}:{entry.get('endpoint')}"
+    """
+    Stable dedup key: sha256 of (normalised detail text + 5-min timestamp bucket).
+    Two entries are "the same event" if they have identical detail and fall in
+    the same 5-minute window — regardless of exact timestamp or order_id.
+    """
+    detail  = str(entry.get("detail") or "").strip().lower()
+    bucket  = _five_min_bucket(entry.get("timestamp"))
+    payload = detail + bucket
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _is_duplicate(entry: dict, last_seen: dict) -> bool:
-    key = _dedup_key(entry)
-    last_ts_str = last_seen.get(key)
-    if not last_ts_str:
+def _is_duplicate(entry: dict, state: dict) -> bool:
+    """Return True if this event has already been dispatched in the current window."""
+    key     = _dedup_key(entry)
+    tracker = state.get("dedup_tracker", {})
+    record  = tracker.get(key)
+    if not record:
         return False
     try:
-        last_ts = datetime.fromisoformat(last_ts_str)
-        age = (datetime.now(timezone.utc) - last_ts).total_seconds()
+        first_seen = datetime.fromisoformat(record["first_seen"])
+        age = (datetime.now(timezone.utc) - first_seen).total_seconds()
         return age < DEDUP_WINDOW_SEC
-    except ValueError:
+    except (ValueError, KeyError):
         return False
 
 
-def _record_seen(entry: dict, last_seen: dict) -> None:
-    key = _dedup_key(entry)
-    last_seen[key] = datetime.now(timezone.utc).isoformat()
+def _handle_duplicate(entry: dict, state: dict) -> None:
+    """
+    Instead of re-dispatching, increment the occurrence counter and update
+    the existing PR body so the reviewer sees the repeat count.
+    """
+    key     = _dedup_key(entry)
+    tracker = state.setdefault("dedup_tracker", {})
+    record  = tracker.get(key, {})
+
+    record["count"]      = record.get("count", 1) + 1
+    record["last_seen"]  = datetime.now(timezone.utc).isoformat()
+    tracker[key]         = record
+
+    pr_number  = record.get("pr_number")
+    first_seen = record.get("first_seen", record["last_seen"])
+    count      = record["count"]
+
+    _log(
+        f"Dedup: {entry.get('action')} already dispatched "
+        f"({count}× in window). Updating PR #{pr_number}."
+    )
+
+    if pr_number:
+        try:
+            github_integration.update_pr_occurrence(pr_number, count, first_seen)
+        except Exception as exc:
+            _log(f"Dedup PR update failed: {exc}", err=True)
+
+
+def _record_seen(entry: dict, state: dict, pr_number: Optional[int] = None) -> None:
+    """Mark this event as seen and store the associated PR number."""
+    key     = _dedup_key(entry)
+    tracker = state.setdefault("dedup_tracker", {})
+    tracker[key] = {
+        "first_seen": datetime.now(timezone.utc).isoformat(),
+        "last_seen":  datetime.now(timezone.utc).isoformat(),
+        "count":      1,
+        "pr_number":  pr_number,
+    }
+    # Legacy last_seen dict kept for state-file backwards compatibility
+    state.setdefault("last_seen", {})[key] = datetime.now(timezone.utc).isoformat()
+
+
+def _update_record_pr(entry: dict, state: dict, pr_number: Optional[int]) -> None:
+    """Attach a PR number to an existing dedup record (called after dispatch returns)."""
+    key    = _dedup_key(entry)
+    record = state.get("dedup_tracker", {}).get(key)
+    if record and pr_number:
+        record["pr_number"] = pr_number
 
 
 # ─── Dispatch ────────────────────────────────────────────────────────────────
 
-def dispatch_batch(batch: list[dict], dry_run: bool = False) -> None:
+def dispatch_batch(
+    batch: list[dict],
+    state: Optional[dict] = None,
+    dry_run: bool = False,
+) -> Optional[int]:
     """
     Send a batch of classified entries to the Security Agent.
     Picks the highest-severity entry as the "lead" for the Fix Proposal.
+
+    Returns the PR number from the Security Agent result (or None).
     """
     if not batch:
-        return
+        return None
 
     sev_order = {"CRITICAL": 0, "SECURITY": 1, "HIGH": 2, "WARNING": 3, "INFO": 4}
     batch.sort(key=lambda e: sev_order.get(e.get("_severity", "INFO"), 4))
@@ -182,11 +265,11 @@ def dispatch_batch(batch: list[dict], dry_run: bool = False) -> None:
     )
 
     if dry_run:
-        print(f"[DRY-RUN] Would dispatch to Security Agent:")
+        print("[DRY-RUN] Would dispatch to Security Agent:")
         print(f"  Lead entry: {json.dumps(lead, indent=4)}")
         if len(batch) > 1:
             print(f"  + {len(batch) - 1} additional event(s) in batch")
-        return
+        return None
 
     _append_website_log(
         "HIGH" if lead.get("_severity") == "CRITICAL" else lead.get("_severity", "HIGH"),
@@ -195,17 +278,23 @@ def dispatch_batch(batch: list[dict], dry_run: bool = False) -> None:
         f"code={lead.get('error_code')} agent={lead.get('agent')}",
     )
 
+    pr_number: Optional[int] = None
     try:
         result = security_agent.handle_event(lead)
         if result:
+            pr_number = result.get("pr_number")
             _log(f"Security Agent result: {result.get('title')} | PR={result.get('pr_url', 'N/A')}")
+            # Attach the PR number back to the dedup record so duplicates can update it
+            if state is not None and pr_number:
+                _update_record_pr(lead, state, pr_number)
         else:
             _log("Security Agent: event below threshold (no handshake triggered)")
     except Exception as exc:
         _log(f"Security Agent raised exception: {exc}", err=True)
-        # Never let watcher crash because of agent errors
         _append_website_log("EMERGENCY",
                              f"Fortress Watcher: Security Agent crashed: {exc}")
+
+    return pr_number
 
 
 # ─── Main daemon ──────────────────────────────────────────────────────────────
@@ -243,11 +332,12 @@ def run_daemon(dry_run: bool = False) -> None:
             if severity == "INFO":
                 continue
 
-            if _is_duplicate(entry, state.get("last_seen", {})):
-                _log(f"Dedup: suppressing {entry.get('action')} (seen within {DEDUP_WINDOW_SEC}s)")
+            if _is_duplicate(entry, state):
+                _handle_duplicate(entry, state)
+                _save_state(state)
                 continue
 
-            _record_seen(entry, state.setdefault("last_seen", {}))
+            _record_seen(entry, state)
             _log(f"New event [{severity}]: {entry.get('action')} "
                  f"code={entry.get('error_code')} agent={entry.get('agent')}")
 
@@ -255,7 +345,9 @@ def run_daemon(dry_run: bool = False) -> None:
             if entry.get("action") in IMMEDIATE_DISPATCH or severity == "CRITICAL":
                 _log(f"Immediate dispatch for [{severity}] event")
                 batch.append(entry)
-                dispatch_batch(batch, dry_run=dry_run)
+                pr_num = dispatch_batch(batch, state=state, dry_run=dry_run)
+                if pr_num:
+                    _update_record_pr(entry, state, pr_num)
                 batch = []
                 batch_start = None
                 state["dispatched_at"] = datetime.now(timezone.utc).isoformat()
@@ -272,7 +364,10 @@ def run_daemon(dry_run: bool = False) -> None:
             elapsed = time.monotonic() - batch_start
             if elapsed >= BATCH_WINDOW_SEC or shutdown:
                 if len(batch) >= DISPATCH_THRESHOLD:
-                    dispatch_batch(batch, dry_run=dry_run)
+                    pr_num = dispatch_batch(batch, state=state, dry_run=dry_run)
+                    if pr_num:
+                        for e in batch:
+                            _update_record_pr(e, state, pr_num)
                     state["dispatched_at"] = datetime.now(timezone.utc).isoformat()
                     _save_state(state)
                 batch = []
@@ -284,7 +379,7 @@ def run_daemon(dry_run: bool = False) -> None:
     # Final drain
     if batch:
         _log(f"Final drain: dispatching {len(batch)} pending events")
-        dispatch_batch(batch, dry_run=dry_run)
+        dispatch_batch(batch, state=state, dry_run=dry_run)
 
     _log("Watcher stopped.")
 
@@ -293,18 +388,27 @@ def run_once(dry_run: bool = False) -> int:
     """Single pass — read all new entries, dispatch if threshold met. For cron."""
     state   = _load_state()
     entries = read_new_entries(state)
-    _save_state(state)
 
-    batch = []
+    batch: list[dict] = []
     for entry in entries:
         severity = classify_entry(entry)
         entry["_severity"] = severity
-        if severity in ("CRITICAL", "SECURITY", "HIGH"):
-            batch.append(entry)
+        if severity not in ("CRITICAL", "SECURITY", "HIGH"):
+            continue
+        if _is_duplicate(entry, state):
+            _handle_duplicate(entry, state)
+            continue
+        _record_seen(entry, state)
+        batch.append(entry)
 
+    _save_state(state)
     _log(f"One-shot: {len(entries)} new entries, {len(batch)} actionable")
     if batch:
-        dispatch_batch(batch, dry_run=dry_run)
+        pr_num = dispatch_batch(batch, state=state, dry_run=dry_run)
+        if pr_num:
+            for e in batch:
+                _update_record_pr(e, state, pr_num)
+        _save_state(state)
     return 0
 
 
