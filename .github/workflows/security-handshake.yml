@@ -1,0 +1,181 @@
+name: Security Handshake — Review Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+
+  push:
+    branches: [security-fixes]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1: Lint the fix-proposal Markdown that Security Agent committed.
+  # Runs on every push to security-fixes branch.
+  # ──────────────────────────────────────────────────────────────────────────
+  validate-fix-proposal:
+    name: Validate Fix Proposal
+    if: github.ref == 'refs/heads/security-fixes'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout security-fixes
+        uses: actions/checkout@v4
+        with:
+          ref: security-fixes
+
+      - name: Find fix-proposal files
+        id: find
+        run: |
+          FILES=$(find security-fixes/ -name "fix-*.md" 2>/dev/null | sort)
+          if [ -z "$FILES" ]; then
+            echo "No fix-proposal files found. Skipping."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+          else
+            COUNT=$(echo "$FILES" | wc -l)
+            echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "files=$FILES" >> "$GITHUB_OUTPUT"
+            echo "Discovered $COUNT fix-proposal file(s):"
+            echo "$FILES"
+          fi
+
+      - name: Check required sections in proposals
+        if: steps.find.outputs.count != '0'
+        run: |
+          FAILED=0
+          for f in security-fixes/fix-*.md; do
+            echo "=== Checking $f ==="
+            for section in "## Summary" "## Root Cause" "## Remediation Steps" "Human-in-the-Loop"; do
+              if ! grep -q "$section" "$f"; then
+                echo "❌  MISSING SECTION: '$section' in $f"
+                FAILED=$((FAILED+1))
+              else
+                echo "✅  Found: $section"
+              fi
+            done
+          done
+          if [ $FAILED -gt 0 ]; then
+            echo "Fix proposal validation failed — $FAILED missing section(s)."
+            exit 1
+          fi
+          echo "All fix-proposal sections validated."
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2: Human-in-the-Loop enforcement on any PR targeting main from
+  #         the security-fixes branch.
+  # ──────────────────────────────────────────────────────────────────────────
+  hitl-gate:
+    name: Human-in-the-Loop Gate
+    if: >
+      github.event_name == 'pull_request' &&
+      github.head_ref == 'security-fixes' &&
+      github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce HitL labels
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = pr.labels.map(l => l.name);
+            const required = ['needs-human-review', 'do-not-auto-merge'];
+            const missing  = required.filter(l => !labels.includes(l));
+            if (missing.length) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: pr.number,
+                labels: missing,
+              });
+              core.notice(`Applied missing HitL labels: ${missing.join(', ')}`);
+            } else {
+              core.notice('All HitL labels already present.');
+            }
+
+      - name: Block auto-merge if attempted
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (pr.auto_merge) {
+              // Disable auto-merge — Safety constraint: human must approve.
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                pull_number: pr.number,
+                auto_merge: null,
+              });
+              core.warning('Auto-merge was enabled — disabled by HitL gate. Human approval required.');
+            }
+
+      - name: Post HitL reminder comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            // Only post once (check for existing bot comment)
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: pr.number,
+            });
+            const botTag = '<!-- hitl-gate-bot -->';
+            const already = comments.data.some(c => c.body.includes(botTag));
+            if (already) {
+              core.notice('HitL reminder already posted — skipping duplicate.');
+              return;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: pr.number,
+              body: `${botTag}
+            ## 🔒 Security Handshake — Human-in-the-Loop Gate
+
+            This PR was **automatically generated** by the \`fortress_watcher\` → \`security_agent\` pipeline.
+
+            | Check | Status |
+            |---|---|
+            | Fix Proposal Present | ✅ |
+            | HitL Labels Applied | ✅ \`needs-human-review\` · \`do-not-auto-merge\` |
+            | Auto-merge Disabled | ✅ |
+
+            **Required before merge:**
+            - [ ] Human reads the \`security-fixes/fix-*.md\` proposal in full
+            - [ ] Human validates the proposed code diff / env change
+            - [ ] Human approves or requests changes
+            - [ ] At least **1 approving review** from a repo collaborator
+
+            > ⚠️ **No code may be merged into \`main\` without explicit human approval.**
+            > The Security Agent proposes; the human disposes.
+            `,
+            });
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 3: Summary — always runs, surfaces diagnostics.
+  # ──────────────────────────────────────────────────────────────────────────
+  handshake-summary:
+    name: Handshake Summary
+    needs: [hitl-gate]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print summary
+        run: |
+          echo "## Security Handshake Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PR | #${{ github.event.pull_request.number }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | \`${{ github.event.action }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| HitL Gate | ✅ Enforced |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> No code will reach \`main\` without human review." >> "$GITHUB_STEP_SUMMARY"
