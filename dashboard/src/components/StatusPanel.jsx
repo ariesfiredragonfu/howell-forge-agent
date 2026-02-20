@@ -2,10 +2,19 @@
  * StatusPanel — live shop health from ForgeContextProvider WebSocket.
  * Shows biofeedback score, health color, order counts, recent events.
  */
+const FORGE_STATUS_COLOR = {
+  IDLE:    '#4a4a6a',
+  RUNNING: '#3b82f6',
+  REVIEW:  '#eab308',
+  ERROR:   '#ef4444',
+}
+
 export default function StatusPanel({ ctx, connected }) {
-  const bf   = ctx?.biofeedback
-  const ords = ctx?.orders
-  const sys  = ctx?.system?.subsystems
+  const bf      = ctx?.biofeedback
+  const ords    = ctx?.orders
+  const sys     = ctx?.system?.subsystems
+  const forge   = ctx?.forge_status
+  const finances = ctx?.finances
 
   const healthColor = {
     HIGH:      '#22c55e',
@@ -109,6 +118,76 @@ export default function StatusPanel({ ctx, connected }) {
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* Forge machine status */}
+      {forge && (
+        <div className="panel p-3">
+          <div className="label mb-1">FORGE MACHINE</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{
+              width: 8, height: 8, borderRadius: '50%',
+              background: FORGE_STATUS_COLOR[forge.status] || '#4a4a6a',
+              display: 'inline-block',
+              boxShadow: forge.status === 'RUNNING'
+                ? `0 0 8px ${FORGE_STATUS_COLOR.RUNNING}`
+                : forge.status === 'REVIEW'
+                  ? `0 0 8px ${FORGE_STATUS_COLOR.REVIEW}`
+                  : 'none',
+            }} />
+            <span style={{
+              fontSize: '0.75rem',
+              color: FORGE_STATUS_COLOR[forge.status] || '#4a4a6a',
+              letterSpacing: '0.1em',
+            }}>
+              {forge.status}
+            </span>
+          </div>
+          {forge.detail && (
+            <div style={{ fontSize: '0.6rem', color: '#4a4a6a', marginTop: 4 }}>
+              {forge.detail}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Finances — USDC + MATIC on Polygon */}
+      {finances && (
+        <div className="panel p-3">
+          <div className="label mb-2">POLYGON WALLET</div>
+          <div style={{ display: 'flex', gap: 16 }}>
+            <div>
+              <div style={{
+                fontSize: '1.1rem', fontWeight: 700,
+                color: finances.usdc != null ? '#22c55e' : '#3a3a5a',
+              }}>
+                {finances.usdc != null ? `$${finances.usdc.toLocaleString()}` : '—'}
+              </div>
+              <div className="label">USDC</div>
+            </div>
+            <div>
+              <div style={{
+                fontSize: '1.1rem', fontWeight: 700,
+                color: finances.matic != null ? '#8b5cf6' : '#3a3a5a',
+              }}>
+                {finances.matic != null ? `${finances.matic} MATIC` : '—'}
+              </div>
+              <div className="label">GAS</div>
+            </div>
+          </div>
+          {finances.note && (
+            <div style={{ fontSize: '0.6rem', color: '#3a3a5a', marginTop: 4 }}>
+              {finances.note}
+            </div>
+          )}
+          {finances.wallet && (
+            <div style={{ fontSize: '0.55rem', color: '#2a2a4a', marginTop: 3,
+                          fontFamily: 'monospace' }}
+                 title={finances.wallet}>
+              {finances.wallet.slice(0, 8)}…{finances.wallet.slice(-6)}
+            </div>
+          )}
         </div>
       )}
 

@@ -817,21 +817,28 @@ def forge_manager_v1(order_id: str, description: str) -> dict:
     output_dir = OUTPUT_BASE / order_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    from forge_context_provider import set_forge_status
+
     # ── 1. Verify PAID ────────────────────────────────────────────────────────
+    set_forge_status("RUNNING", f"Verifying order {order_id}")
     _verify_paid_order(order_id)
 
     # ── 2. Generate FreeCAD script ────────────────────────────────────────────
+    set_forge_status("RUNNING", f"Generating CAD script — {description[:60]}")
     part_code = _generate_freecad_script(description, output_dir)
 
     # ── 3. Run FreeCAD headless → STEP + STL ─────────────────────────────────
+    set_forge_status("RUNNING", "FreeCAD headless — exporting STEP + STL")
     freecad_paths = _run_freecad_headless(order_id, part_code, output_dir)
 
     # ── 4. Generate stub G-code + validate ───────────────────────────────────
+    set_forge_status("RUNNING", "Generating G-code + validation")
     gcode_path  = _generate_stub_gcode(order_id, description, freecad_paths, output_dir)
     validation  = _validate_gcode(gcode_path)
     freecad_paths["gcode"] = gcode_path
 
     # ── 4b. SHA-256 hash STEP + G-code + STL → on-chain anchor ───────────────
+    set_forge_status("RUNNING", "Hashing outputs → on-chain anchor")
     from forge_hash import hash_forge_outputs, push_hash_to_chain
     hashes       = hash_forge_outputs(
         step_path  = freecad_paths.get("step"),
@@ -839,14 +846,16 @@ def forge_manager_v1(order_id: str, description: str) -> dict:
         stl_path   = freecad_paths.get("stl"),
     )
     chain_receipt = push_hash_to_chain(hashes, order_id)
-    freecad_paths["hashes"]       = hashes
+    freecad_paths["hashes"]        = hashes
     freecad_paths["chain_receipt"] = chain_receipt
     (output_dir / "hashes.json").write_text(json.dumps({**hashes, "chain": chain_receipt}, indent=2))
 
     # ── 4c. Render toolpath visualisation ────────────────────────────────────
+    set_forge_status("RUNNING", "Rendering previews")
     _render_toolpath(gcode_path, output_dir, freecad_paths.get("bbox_mm", []))
 
     # ── 5. Human review ───────────────────────────────────────────────────────
+    set_forge_status("REVIEW", f"Awaiting approval — {order_id}")
     approved = _human_review(freecad_paths["stl"], gcode_path, validation)
 
     # ── 6. Biofeedback + order update ─────────────────────────────────────────
@@ -888,6 +897,7 @@ def forge_manager_v1(order_id: str, description: str) -> dict:
     (output_dir / "forge_log.json").write_text(json.dumps(log, indent=2))
     print(f"[FORGE] Run log → {output_dir}/forge_log.json")
 
+    set_forge_status("IDLE", f"Order {order_id} complete — {result['status']}")
     result["order_id"] = order_id
     result["paths"]    = freecad_paths
     return result

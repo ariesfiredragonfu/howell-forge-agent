@@ -5,10 +5,16 @@ ForgeContextProvider — Live shop-floor snapshot for the ARIA dashboard agent.
 Aggregates data from every subsystem into a single JSON object:
   - Orders     : SQLite via eliza_memory (all active + recent completed)
   - Biofeedback: EWMA score + recent event stream from Redis
-  - Kaito      : Blockchain payment status for any PAID orders with tx IDs
+  - Finances   : USDC + MATIC balance on Polygon via Web3 (Alchemy RPC)
+  - Forge state: forge:status Redis key (IDLE / RUNNING / REVIEW / ERROR)
   - Forge runs : Most recent forge_manager output per order (renders, gcode)
   - Security   : Recent security events from SecurityContextProvider
   - System     : Timestamp, uptime marker, provider health
+
+Polygon/Web3 config (set in eliza-config.json or environment):
+  ALCHEMY_KEY          Alchemy API key for Polygon mainnet RPC
+  KAITO_WALLET         Wallet address to check USDC balance
+  USDC_POLYGON         USDC contract on Polygon (default: well-known address)
 
 Designed to be called every 2 seconds by the FastAPI WebSocket broadcaster.
 Each call is fully synchronous — no async, no caching between calls.
@@ -34,8 +40,157 @@ from eliza_providers import OrderStateProvider, SecurityContextProvider
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 FORGE_ORDERS_DIR = Path.home() / "Hardware_Factory" / "forge_orders"
-_order_provider  = OrderStateProvider()
+_order_provider    = OrderStateProvider()
 _security_provider = SecurityContextProvider()
+
+# Polygon / Web3 config — set these in environment or eliza-config.json
+# USDC on Polygon PoS mainnet (official Circle contract)
+USDC_POLYGON_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_DECIMALS        = 6   # USDC uses 6 decimals on Polygon
+
+# Minimal ERC-20 ABI — only balanceOf needed
+_ERC20_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function",
+    }
+]
+
+# Redis key written by forge_manager_v1 to broadcast machine state
+FORGE_STATUS_KEY = "forge:status"
+
+
+# ─── forge:status Redis helpers ───────────────────────────────────────────────
+
+def set_forge_status(status: str, detail: str = "") -> None:
+    """
+    Write the current forge machine state to Redis.
+    Called by forge_manager_v1 at each workflow step.
+    Status values: IDLE | RUNNING | REVIEW | ERROR
+    """
+    try:
+        r = biofeedback._get_redis()
+        if r:
+            r.set(FORGE_STATUS_KEY, json.dumps({
+                "status": status,
+                "detail": detail,
+                "ts":     datetime.now(timezone.utc).isoformat(),
+            }))
+    except Exception:
+        pass   # forge status is best-effort, never block the workflow
+
+
+def get_forge_status() -> dict:
+    """Read the current forge machine state from Redis."""
+    try:
+        r = biofeedback._get_redis()
+        if r:
+            raw = r.get(FORGE_STATUS_KEY)
+            if raw:
+                return json.loads(raw)
+    except Exception:
+        pass
+    return {"status": "IDLE", "detail": "", "ts": None}
+
+
+# ─── Polygon / Web3 finance snapshot ─────────────────────────────────────────
+
+def _get_web3() -> "Web3 | None":
+    """
+    Build a Web3 instance using the Alchemy RPC URL.
+    Returns None (gracefully) if web3 not installed or no API key configured.
+    """
+    try:
+        from web3 import Web3
+        key = os.environ.get("ALCHEMY_KEY", "").strip()
+        if not key:
+            # Try reading from eliza-config
+            cfg_path = Path(__file__).parent / "eliza-config.json"
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text())
+                key = cfg.get("polygon", {}).get("alchemy_key", "")
+        if not key:
+            return None
+        rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{key}"
+        return Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 5}))
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def _finances_snapshot() -> dict:
+    """
+    Query Polygon for MATIC balance and USDC balance of the Kaito wallet.
+
+    - MATIC: native gas token → web3.eth.get_balance() (18 decimals)
+    - USDC:  ERC-20 stablecoin → balanceOf() on the USDC contract (6 decimals)
+
+    Note: Gemini's snippet used get_balance() for USDC — that returns MATIC,
+    not USDC. USDC requires an ERC-20 contract call. This is the correct version.
+
+    Falls back gracefully if Alchemy key not set or web3 unavailable.
+    """
+    try:
+        import kaito_engine
+        cfg = kaito_engine._load_config()
+        wallet = cfg.get("wallet_address", "").strip()
+    except Exception:
+        wallet = os.environ.get("KAITO_WALLET", "").strip()
+
+    if not wallet or wallet == "0x0000000000000000000000000000000000000000":
+        return {
+            "usdc":    None,
+            "matic":   None,
+            "wallet":  wallet or None,
+            "network": "polygon",
+            "note":    "Wallet address not configured",
+        }
+
+    w3 = _get_web3()
+    if not w3:
+        return {
+            "usdc":    None,
+            "matic":   None,
+            "wallet":  wallet,
+            "network": "polygon",
+            "note":    "Alchemy key not set (ALCHEMY_KEY env or eliza-config.json)",
+        }
+
+    from web3 import Web3
+
+    result: dict = {
+        "usdc":    None,
+        "matic":   None,
+        "wallet":  wallet,
+        "network": "polygon",
+        "note":    None,
+    }
+
+    # MATIC balance (native — 18 decimals)
+    try:
+        matic_wei   = w3.eth.get_balance(Web3.to_checksum_address(wallet))
+        result["matic"] = round(matic_wei / 10 ** 18, 6)
+    except Exception as exc:
+        result["matic_error"] = str(exc)[:80]
+
+    # USDC balance (ERC-20 — 6 decimals)
+    try:
+        usdc = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_POLYGON_ADDRESS),
+            abi=_ERC20_ABI,
+        )
+        raw_balance     = usdc.functions.balanceOf(
+            Web3.to_checksum_address(wallet)
+        ).call()
+        result["usdc"]  = round(raw_balance / 10 ** USDC_DECIMALS, 2)
+    except Exception as exc:
+        result["usdc_error"] = str(exc)[:80]
+
+    return result
 
 # ─── Kaito payment helper ─────────────────────────────────────────────────────
 
@@ -231,24 +386,28 @@ class ForgeContextProvider:
 
         # Run each subsystem — isolate failures so one bad subsystem
         # doesn't kill the entire context pulse.
-        bf_data      = self._safe("biofeedback", _biofeedback_snapshot)
-        orders_data  = self._safe("orders",      _orders_snapshot)
-        security_data = self._safe("security",
-                                   lambda: _security_provider.get().copy())
+        bf_data       = self._safe("biofeedback", _biofeedback_snapshot)
+        orders_data   = self._safe("orders",      _orders_snapshot)
+        security_data = self._safe("security",    lambda: _security_provider.get().copy())
+        finances_data = self._safe("finances",    _finances_snapshot)
+        forge_status  = self._safe("forge_status", get_forge_status)
 
         return {
             "timestamp":    ts,
             "biofeedback":  bf_data,
             "orders":       orders_data,
+            "finances":     finances_data,
+            "forge_status": forge_status,
             "security":     security_data,
             "system": {
                 "provider":   "ForgeContextProvider",
-                "version":    "1.0.0",
+                "version":    "1.1.0",
                 "forge_dir":  str(FORGE_ORDERS_DIR),
                 "subsystems": {
                     "biofeedback_ok": "provider failed" not in str(bf_data),
                     "orders_ok":      "provider failed" not in str(orders_data),
                     "security_ok":    "provider failed" not in str(security_data),
+                    "finances_ok":    "provider failed" not in str(finances_data),
                 },
             },
         }
