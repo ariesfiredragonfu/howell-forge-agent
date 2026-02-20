@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@theme {
+  --color-forge-bg:     #0a0a12;
+  --color-forge-panel:  #111120;
+  --color-forge-border: #1e1e3a;
+  --color-forge-accent: #3b82f6;
+  --color-forge-green:  #22c55e;
+  --color-forge-yellow: #eab308;
+  --color-forge-red:    #ef4444;
+  --color-forge-dim:    #4a4a6a;
+  --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+}
+
+body {
+  background: var(--color-forge-bg);
+  color: #c8c8e8;
+  font-family: var(--font-mono);
+  margin: 0;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar        { width: 4px; }
+::-webkit-scrollbar-track  { background: var(--color-forge-bg); }
+::-webkit-scrollbar-thumb  { background: var(--color-forge-border); border-radius: 2px; }
+
+.panel {
+  background: var(--color-forge-panel);
+  border: 1px solid var(--color-forge-border);
+  border-radius: 4px;
+}
+
+.label {
+  font-size: 0.6rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--color-forge-dim);
+}

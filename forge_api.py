@@ -39,7 +39,8 @@ from forge_manager_v1 import forge_manager_v1
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 # ─── App setup ────────────────────────────────────────────────────────────────
 
@@ -145,6 +146,19 @@ def get_biofeedback():
 def list_orders():
     orders = eliza_memory.get_all_orders()
     return {"total": len(orders), "orders": orders}
+
+
+@app.get("/forge-file/{order_id}/{filename}")
+def serve_forge_file(order_id: str, filename: str):
+    """Serve STL, STEP, G-code, or PNG renders for an order."""
+    allowed = {".stl", ".step", ".gcode", ".png"}
+    p = Path(FORGE_ORDERS_DIR) / order_id / filename
+    if not p.exists() or p.suffix.lower() not in allowed:
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(p))
+
+
+FORGE_ORDERS_DIR = Path.home() / "Hardware_Factory" / "forge_orders"
 
 
 @app.get("/orders/{order_id}")
