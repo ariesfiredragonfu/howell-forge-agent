@@ -57,10 +57,15 @@ log = logging.getLogger("pubsub_listener")
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-REDIS_URL          = "redis://localhost:6379/0"
-_RECONNECT_BASE    = 2    # seconds — first retry wait
-_RECONNECT_CAP     = 64   # seconds — max back-off ceiling
-_SOCKET_TIMEOUT    = 5.0  # seconds
+REDIS_URL               = "redis://localhost:6379/0"
+_RECONNECT_BASE         = 2    # seconds — first retry wait
+_RECONNECT_CAP          = 64   # seconds — max back-off ceiling
+_HEALTH_CHECK_INTERVAL  = 30   # seconds — redis-py sends PING to keep idle conn alive
+
+# socket_timeout is intentionally NOT set on the pub/sub async client.
+# A timeout on a blocking read will raise TimeoutError on every idle period,
+# causing a needless reconnect loop.  Instead we rely on health_check_interval
+# to detect dead connections without interrupting legitimate idle waits.
 
 # Use the class attribute directly — never instantiate a backend just to
 # read a constant.  (Grok's draft used RedisBackend().namespace which
@@ -76,7 +81,13 @@ except ImportError:
 # ─── CS agent reaction ────────────────────────────────────────────────────────
 
 import eliza_memory
-from alerts import send_telegram_alert          # thin wrapper already in repo
+from eliza_db import init_db as _init_db
+from notifications import send_telegram_alert
+
+# Initialise the database backend from eliza-config.json so this process
+# uses the same backend (Redis or SQLite) as the rest of the system.
+# Must run before any eliza_memory call so get_db() returns the right backend.
+_init_db()
 
 
 def _react_to_paid(order_id: str, data: dict, timestamp: str) -> None:
@@ -151,7 +162,8 @@ async def _listen_once(
     async with Redis.from_url(
         redis_url,
         decode_responses=True,
-        socket_timeout=_SOCKET_TIMEOUT,
+        socket_keepalive=True,                        # TCP keepalive for long-lived conn
+        health_check_interval=_HEALTH_CHECK_INTERVAL, # redis-py PINGs to detect dead conn
     ) as client:
         async with client.pubsub() as pubsub:
             await pubsub.subscribe(_CHANNEL)
@@ -269,17 +281,35 @@ async def start_listener_task(redis_url: str = REDIS_URL) -> asyncio.Task:
 
 # ─── Standalone entry point ───────────────────────────────────────────────────
 
-async def _main_async() -> None:
+async def _main_async(redis_url: str) -> None:
     if not _REDIS_PKG_OK:
         log.error("redis[asyncio] package not installed. Run: pip install redis")
         sys.exit(1)
 
+    # Align the query backend with the pub/sub backend so _react_to_paid
+    # looks up orders in the same Redis instance that published the event.
+    # (init_db() defaults to SQLiteBackend when eliza-config.json has no
+    # "database" block — the listener would then fail the idempotency check
+    # every time because get_order() reads from a different store.)
+    from eliza_db import set_backend as _set_backend
+    from redis_backend import RedisBackend as _RB
+    _set_backend(_RB(url=redis_url))
+    log.info("Query backend set to RedisBackend (%s)", redis_url)
+
     log.info("Starting Howell Forge pub/sub listener (channel: %s)", _CHANNEL)
     try:
-        await _listener_with_reconnect(REDIS_URL)
+        await _listener_with_reconnect(redis_url)
     except KeyboardInterrupt:
         log.info("Interrupted — exiting")
 
 
 if __name__ == "__main__":
-    asyncio.run(_main_async())
+    import argparse
+    ap = argparse.ArgumentParser(description="Howell Forge Redis pub/sub listener")
+    ap.add_argument(
+        "--redis-url",
+        default=REDIS_URL,
+        help=f"Redis URL (default: {REDIS_URL})",
+    )
+    args = ap.parse_args()
+    asyncio.run(_main_async(args.redis_url))
