@@ -10,6 +10,11 @@ ElizaOS Order Loop:
   --order-loop-start  Start the Order Loop daemon in the background (long-running)
   --order-loop-status Print current Eliza memory state and exit
 
+Redis Pub/Sub (requires backend=redis in eliza-config.json):
+  --pubsub-listener   Start the real-time order-event listener (long-running)
+                      Reacts to "paid" events on howell:order_events channel
+                      with CS agent notification + Telegram alert
+
 Existing flags unchanged — backward compatible.
 """
 
@@ -73,6 +78,24 @@ def start_order_loop_daemon(workers: int = 3) -> subprocess.Popen:
     return proc
 
 
+def start_pubsub_listener() -> subprocess.Popen:
+    """
+    Launch the Redis pub/sub listener as a background process.
+
+    Requires backend=redis in eliza-config.json and a running Redis instance.
+    The listener subscribes to howell:order_events and reacts to "paid" events
+    in real-time — CS agent notification without polling.
+
+    Returns the Popen handle so the caller can monitor or terminate it.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, str(AGENT_DIR / "run_pubsub_listener.py")],
+        cwd=str(AGENT_DIR),
+    )
+    print(f"Pub/sub listener started (PID {proc.pid}, channel=howell:order_events)")
+    return proc
+
+
 def print_order_loop_status() -> None:
     """Print Eliza memory state via run_order_loop.py --status."""
     subprocess.run(
@@ -97,6 +120,10 @@ def main() -> int:
         except (ValueError, IndexError):
             pass
         start_order_loop_daemon(workers=workers)
+        return 0
+
+    if "--pubsub-listener" in args:
+        start_pubsub_listener()
         return 0
 
     # ── Standard orchestration ────────────────────────────────────────────────
