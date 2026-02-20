@@ -438,7 +438,8 @@ def _human_review(stl_path: Path, gcode_path: Path, validation: dict) -> bool:
     print(f"  G-code:             {gcode_path}")
     print()
     print("  Commands:")
-    print(f"    freecadcmd --open {stl_path}   (or open in FreeCAD GUI)")
+    print(f"    blender {stl_path}              (fastest — drag-rotate to inspect)")
+    print(f"    freecad {stl_path}              (FreeCAD GUI — may take 10-20s to load)")
     print(f"    cat {gcode_path}")
     print()
 
