@@ -34,12 +34,15 @@ _ORIG_REWARDS   = bf.REWARDS_PATH
 _ORIG_CONSTR    = bf.CONSTRAINTS_PATH
 _ORIG_SCALE     = bf.SCALE_STATE_PATH
 _ORIG_EWMA      = bf.EWMA_STATE_PATH
+_ORIG_STREAM    = bf._STREAM_KEY
 
 bf.BIOFEEDBACK_DIR  = _TMP
 bf.REWARDS_PATH     = _TMP / "rewards.md"
 bf.CONSTRAINTS_PATH = _TMP / "constraints.md"
 bf.SCALE_STATE_PATH = _TMP / "scale_state.json"
 bf.EWMA_STATE_PATH  = _TMP / "ewma_state.json"
+# Isolated stream key so the adaptive boost counts don't bleed between test runs
+bf._STREAM_KEY      = "howell:biofeedback_events:herald_test"
 
 import marketing as mkt
 _ORIG_BURST_LOG = mkt._BURST_LOG_PATH
@@ -59,11 +62,18 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def reset_ewma() -> None:
-    """Wipe EWMA state between test cases."""
+    """Wipe EWMA file state + isolated test stream between test cases."""
     if bf.EWMA_STATE_PATH.exists():
         bf.EWMA_STATE_PATH.unlink()
     if mkt._BURST_LOG_PATH.exists():
         mkt._BURST_LOG_PATH.unlink()
+    # Flush the isolated Redis stream so adaptive counts start from 0 each test
+    r = bf._get_redis()
+    if r:
+        try:
+            r.delete(bf._STREAM_KEY)
+        except Exception:
+            pass
 
 
 def _mock_append_reward(agent, message, kpi=None, event_type="marketing_pass"):
@@ -92,9 +102,17 @@ def test_seo_pass_reward() -> None:
     score_after = bf.get_score()
     check("Score increased after seo_pass", score_after > score_before,
           f"{score_before:.4f} → {score_after:.4f}")
-    check("Reward delta matches EVENT_WEIGHTS['seo_pass']",
-          abs((score_after - score_before) - bf.EVENT_WEIGHTS["seo_pass"]) < 0.01,
-          f"delta={score_after - score_before:.4f} expected={bf.EVENT_WEIGHTS['seo_pass']}")
+    # With adaptive boost active on first event (count=0 ≤ rare_threshold),
+    # effective weight = base × boost_factor; accept either base or boosted delta.
+    base_w   = bf.EVENT_WEIGHTS["seo_pass"]
+    cfg      = bf._get_adaptive_config()
+    factor   = cfg.get("reward_boost_factor", 1.2) if cfg else 1.0
+    delta    = score_after - score_before
+    boosted_ok = abs(delta - base_w * factor) < 0.01
+    base_ok    = abs(delta - base_w) < 0.01
+    check("Reward delta matches base or adaptive-boosted seo_pass weight",
+          boosted_ok or base_ok,
+          f"delta={delta:.4f} base={base_w} boosted={base_w * factor:.4f}")
     check("rewards.md written", bf.REWARDS_PATH.exists())
 
 
@@ -264,10 +282,17 @@ def test_generate_post_high_engagement() -> None:
     ):
         mkt.generate_post("Herald (Social Post)", "Steel post.", likes=5, replies=2, retweets=1)
 
-    state = bf.get_ewma_state()
-    check("Score is seo_pass only when under all engagement thresholds",
-          abs(state["current_score"] - 1.0) < 0.01,
-          f"score={state['current_score']:.4f} expected=1.0")
+    state    = bf.get_ewma_state()
+    base_w   = bf.EVENT_WEIGHTS["seo_pass"]
+    cfg      = bf._get_adaptive_config()
+    factor   = cfg.get("reward_boost_factor", 1.2) if cfg else 1.0
+    score    = state["current_score"]
+    # With a clean stream the first seo_pass earns the rare-reward boost (×1.2).
+    # No x_engagement_high emitted → score is seo_pass weight only (base or boosted).
+    seo_only = abs(score - base_w) < 0.01 or abs(score - base_w * factor) < 0.01
+    check("Score is seo_pass weight only (no x_engagement_high) — base or boosted",
+          seo_only,
+          f"score={score:.4f} base={base_w} boosted={base_w * factor:.4f}")
 
 
 # ─── Test 8: generate_post validation fail ───────────────────────────────────
@@ -316,14 +341,21 @@ def main() -> int:
     print(f"Results: {passed}/{total} passed")
     print(f"{'='*60}")
 
-    # Cleanup temp dir
+    # Cleanup temp dir + test stream
     shutil.rmtree(_tmp, ignore_errors=True)
+    r = bf._get_redis()
+    if r:
+        try:
+            r.delete(bf._STREAM_KEY)
+        except Exception:
+            pass
     # Restore module-level paths
     bf.BIOFEEDBACK_DIR  = _ORIG_BF_DIR
     bf.REWARDS_PATH     = _ORIG_REWARDS
     bf.CONSTRAINTS_PATH = _ORIG_CONSTR
     bf.SCALE_STATE_PATH = _ORIG_SCALE
     bf.EWMA_STATE_PATH  = _ORIG_EWMA
+    bf._STREAM_KEY      = _ORIG_STREAM
     mkt._BURST_LOG_PATH = _ORIG_BURST_LOG
 
     return 0 if passed == total else 1

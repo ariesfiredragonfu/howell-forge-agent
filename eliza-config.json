@@ -278,6 +278,15 @@
       "throttle": -2.0
     },
     "_comment": "Set use_ewma: false to fall back to simple event-count scoring (rewards - constraints)",
+    "adaptive": {
+      "enabled": true,
+      "constraint_repeat_threshold": 3,
+      "constraint_boost_factor": 1.5,
+      "reward_rare_threshold": 1,
+      "reward_boost_factor": 1.2,
+      "boost_decay_hours": 48,
+      "_comment": "boost_decay_hours is the sliding count window — events older than this age out, reverting weight to base"
+    },
     "reward_types": {
       "seo_pass": 1.0,
       "x_engagement_high": 2.0

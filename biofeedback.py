@@ -67,6 +67,143 @@ def _use_ewma() -> bool:
     return _load_config().get("use_ewma", True)
 
 
+def _get_adaptive_config() -> dict:
+    """Return the biofeedback.adaptive block, or {} if missing/disabled."""
+    cfg = _load_config().get("adaptive", {})
+    if not cfg.get("enabled", True):
+        return {}
+    return cfg
+
+
+# ─── Redis event stream ───────────────────────────────────────────────────────
+# howell:biofeedback_events — append-only stream; IDs encode event timestamp
+# so XRANGE queries respect mock _now_ts in tests.
+
+_STREAM_KEY = "howell:biofeedback_events"
+_redis_client = None   # module-level singleton; lazy-init on first use
+
+
+def _get_redis():
+    """Return a live Redis client, or None if unavailable. Never raises."""
+    global _redis_client
+    if _redis_client is not None:
+        try:
+            _redis_client.ping()
+            return _redis_client
+        except Exception:
+            _redis_client = None
+    try:
+        import redis as _redis_lib          # noqa: PLC0415
+        r = _redis_lib.Redis(decode_responses=True)
+        r.ping()
+        _redis_client = r
+        return _redis_client
+    except Exception:
+        return None
+
+
+def _stream_xadd(event_type: str, base_weight: float, now_ts: float) -> None:
+    """
+    Append an event to the Redis stream using an explicit millisecond-epoch ID.
+
+    The ID encodes `now_ts` so XRANGE-based count queries respect mock timestamps
+    in tests.  Sub-millisecond uniqueness comes from time.time_ns().
+    Falls back to auto-ID ('*') on ID collision (extremely rare).
+    Best-effort — never raises.
+    """
+    r = _get_redis()
+    if r is None:
+        return
+    try:
+        ms  = int(now_ts * 1000)
+        seq = int(time.time_ns() % 1_000_000)   # sub-ms uniqueness
+        fields = {
+            "type":      event_type,
+            "timestamp": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+            "weight":    str(base_weight),
+        }
+        try:
+            r.xadd(_STREAM_KEY, fields, id=f"{ms}-{seq}")
+        except Exception:
+            r.xadd(_STREAM_KEY, fields)   # fallback: let Redis pick the ID
+    except Exception:
+        pass   # stream write is best-effort; never crash the scoring path
+
+
+def get_recent_event_count(
+    event_type: str,
+    hours: int = 24,
+    _now_ts: Optional[float] = None,
+) -> int:
+    """
+    Count occurrences of `event_type` in the Redis stream within the last
+    `hours` hours.
+
+    Uses XRANGE with explicit millisecond-epoch boundaries so mock _now_ts
+    values (for tests) work correctly.
+
+    Returns 0 if Redis is unavailable — adaptive boost simply won't fire,
+    which is the safe degraded behaviour.
+    """
+    r = _get_redis()
+    if r is None:
+        return 0
+    now    = _now_ts if _now_ts is not None else time.time()
+    min_ms = int((now - hours * 3600) * 1000)
+    max_ms = int(now * 1000)
+    try:
+        entries = r.xrange(_STREAM_KEY, min=f"{min_ms}-0", max=f"{max_ms}-9999999")
+        return sum(1 for _, fields in entries if fields.get("type") == event_type)
+    except Exception:
+        return 0
+
+
+def get_adaptive_weight(
+    base_weight: float,
+    event_type: str,
+    _now_ts: Optional[float] = None,
+) -> tuple[float, str]:
+    """
+    Return (effective_weight, boost_note) for the given base weight.
+
+    Boost rules (from eliza-config.json biofeedback.adaptive):
+      Negative weight — if count in last boost_decay_hours ≥ constraint_repeat_threshold:
+        effective = base × constraint_boost_factor   (e.g. -1.0 → -1.5)
+      Positive weight — if count in last boost_decay_hours ≤ reward_rare_threshold:
+        effective = base × reward_boost_factor       (e.g. 1.0 → 1.2)
+
+    boost_decay_hours acts as the sliding count window.  After that many hours
+    without a repeat the count falls to 0 and the weight reverts to base.
+
+    Returns (base_weight, "") when adaptive is disabled or Redis is down.
+    """
+    cfg = _get_adaptive_config()
+    if not cfg:
+        return base_weight, ""
+
+    decay_hours = cfg.get("boost_decay_hours", 48)
+    count = get_recent_event_count(event_type, hours=decay_hours, _now_ts=_now_ts)
+
+    if base_weight < 0:
+        threshold = cfg.get("constraint_repeat_threshold", 3)
+        factor    = cfg.get("constraint_boost_factor", 1.5)
+        if count >= threshold:
+            return (
+                base_weight * factor,
+                f"adaptive boost {factor}× applied (count_{decay_hours}h={count} ≥ {threshold})",
+            )
+    elif base_weight > 0:
+        threshold = cfg.get("reward_rare_threshold", 1)
+        factor    = cfg.get("reward_boost_factor", 1.2)
+        if count <= threshold:
+            return (
+                base_weight * factor,
+                f"adaptive boost {factor}× applied (count_{decay_hours}h={count} ≤ {threshold})",
+            )
+
+    return base_weight, ""
+
+
 # ─── EWMA constants ───────────────────────────────────────────────────────────
 
 HALF_LIFE_DAYS = 7
@@ -152,13 +289,16 @@ def _audit_remember(
     event_type: str,
     pre_decay_score: float,
     decayed_score: float,
-    weight: float,
+    base_weight: float,
+    effective_weight: float,
     new_score: float,
     elapsed_sec: float,
+    boost_note: str = "",
 ) -> None:
     """
     Write an audit memory entry to Eliza memory.
 
+    Includes effective_weight and boost_note when an adaptive boost is active.
     Best-effort — DB unavailability must never break the scoring path.
     Lazy import avoids the circular-import risk (biofeedback ← eliza_memory
     ← eliza_db; none of those import biofeedback).
@@ -167,11 +307,13 @@ def _audit_remember(
         import eliza_memory  # noqa: PLC0415  (lazy intentionally)
         elapsed_days = elapsed_sec / 86400
         decay_delta  = decayed_score - pre_decay_score
+        boost_part   = f"; {boost_note}" if boost_note else ""
         rationale = (
             f"EWMA decay applied: {decay_delta:+.4f} "
             f"from {elapsed_days:.2f}-day-old score "
             f"(λ·t={DECAY_LAMBDA * elapsed_sec:.4f}); "
-            f"event={event_type} weight={weight:+.1f}; "
+            f"event={event_type} base_weight={base_weight:+.1f} "
+            f"effective_weight={effective_weight:+.4f}{boost_part}; "
             f"score {pre_decay_score:.4f} → {decayed_score:.4f} → {new_score:.4f}"
         )
         eliza_memory.remember(
@@ -179,13 +321,15 @@ def _audit_remember(
             type_   = "BIOFEEDBACK_EWMA",
             content = rationale,
             metadata= {
-                "event_type":    event_type,
-                "weight":        weight,
-                "pre_decay":     round(pre_decay_score, 6),
-                "post_decay":    round(decayed_score,   6),
-                "new_score":     round(new_score,       6),
-                "elapsed_days":  round(elapsed_days,    4),
-                "half_life_days": HALF_LIFE_DAYS,
+                "event_type":      event_type,
+                "base_weight":     base_weight,
+                "effective_weight": effective_weight,
+                "boost_note":      boost_note,
+                "pre_decay":       round(pre_decay_score, 6),
+                "post_decay":      round(decayed_score,   6),
+                "new_score":       round(new_score,       6),
+                "elapsed_days":    round(elapsed_days,    4),
+                "half_life_days":  HALF_LIFE_DAYS,
             },
         )
     except Exception:
@@ -202,14 +346,25 @@ def record_event(
 
     Primary write path — append_reward() and append_constraint() call this.
 
+    Adaptive weight logic (when Redis is available):
+      Before writing to the stream, get_adaptive_weight() checks the count of
+      this event_type over the last boost_decay_hours hours:
+        - Negative weight + count ≥ constraint_repeat_threshold → boost ×1.5
+        - Positive weight + count ≤ reward_rare_threshold       → boost ×1.2
+      The effective (boosted) weight is used in the EWMA update; the base
+      weight is stored in the stream entry and the audit log for transparency.
+
     When use_ewma=true (default):
-      1. Decay the stored score for time elapsed since the last event.
-      2. Add the event weight.
-      3. Clamp to [SCORE_FLOOR, +∞].
-      4. Write an audit entry to Eliza memory.
+      1. Compute adaptive weight (queries stream prior event count).
+      2. XADD current event to Redis stream (encodes now_ts in stream ID).
+      3. Decay the stored score for time elapsed since the last event.
+      4. Add the effective weight.
+      5. Clamp to [SCORE_FLOOR, +∞].
+      6. Write an audit entry to Eliza memory (includes boost note if active).
 
     When use_ewma=false:
-      Increment positive_count or negative_count and return _legacy_score().
+      Increment positive_count or negative_count and return _legacy_score()
+      (adaptive weights do not apply in legacy mode).
 
     Args:
         event_type: Key from EVENT_WEIGHTS (unknown types score 0 and skip audit).
@@ -217,15 +372,22 @@ def record_event(
         _now_ts:    Unix timestamp override (for deterministic tests).
     """
     _ensure_dir()
-    weight = EVENT_WEIGHTS.get(event_type, 0.0)
-    if weight == 0.0:
+    base_weight = EVENT_WEIGHTS.get(event_type, 0.0)
+    if base_weight == 0.0:
         return get_score()
 
     now_ts = _now_ts if _now_ts is not None else time.time()
-    state  = _load_ewma()
+
+    # ── Adaptive weight (query stream BEFORE this event is added) ─────────────
+    effective_weight, boost_note = get_adaptive_weight(base_weight, event_type, _now_ts=_now_ts)
+
+    # ── Append to Redis event stream ──────────────────────────────────────────
+    _stream_xadd(event_type, base_weight, now_ts)
+
+    state = _load_ewma()
 
     # ── Track raw counts for legacy fallback regardless of mode ───────────────
-    if weight > 0:
+    if base_weight > 0:
         state["positive_count"] = state.get("positive_count", 0) + 1
     else:
         state["negative_count"] = state.get("negative_count", 0) + 1
@@ -236,18 +398,23 @@ def record_event(
         _save_ewma(state)
         return _legacy_score(state)
 
-    # ── EWMA path ─────────────────────────────────────────────────────────────
+    # ── EWMA path (uses effective_weight) ─────────────────────────────────────
     pre_decay_score = state["score"]
     elapsed_sec     = max(0.0, now_ts - state["last_event_ts"]) \
                       if state.get("last_event_ts") is not None else 0.0
     decayed         = _decay(pre_decay_score, state.get("last_event_ts"), now_ts)
-    new_score       = max(SCORE_FLOOR, decayed + weight)
+    new_score       = max(SCORE_FLOOR, decayed + effective_weight)
 
     state["score"]         = new_score
     state["last_event_ts"] = now_ts
     _save_ewma(state)
 
-    _audit_remember(agent, event_type, pre_decay_score, decayed, weight, new_score, elapsed_sec)
+    _audit_remember(
+        agent, event_type,
+        pre_decay_score, decayed,
+        base_weight, effective_weight,
+        new_score, elapsed_sec, boost_note,
+    )
     return new_score
 
 
