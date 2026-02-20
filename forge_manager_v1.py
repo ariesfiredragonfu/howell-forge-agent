@@ -507,13 +507,55 @@ def _render_previews(stl_path: Path, output_dir: Path) -> list[Path]:
 
 # ─── Step 5: Human visual check ──────────────────────────────────────────────
 
+def _open_previews(pngs: list[Path]) -> None:
+    """
+    Launch EOG (Eye of GNOME) with all preview PNGs in the background.
+    Falls back to xdg-open one-by-one if eog is unavailable.
+    Non-blocking — returns immediately so the y/N prompt still appears.
+    """
+    import shutil
+    if not pngs:
+        return
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+
+    eog = shutil.which("eog")
+    if eog:
+        # eog accepts multiple files and shows them in a single window gallery
+        subprocess.Popen(
+            [eog] + [str(p) for p in pngs],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        print(f"[FORGE] ✓ EOG image viewer opened ({len(pngs)} views) — inspect, then return here")
+        return
+
+    xdg = shutil.which("xdg-open")
+    if xdg:
+        for p in pngs:
+            subprocess.Popen(
+                [xdg, str(p)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        print(f"[FORGE] ✓ Opened {len(pngs)} preview images via xdg-open")
+        return
+
+    print("[FORGE] No image viewer found — open PNGs manually from the paths below")
+
+
 def _human_review(stl_path: Path, gcode_path: Path, validation: dict) -> bool:
     """
-    Render STL previews, then pause for human Y/N approval.
+    Render STL previews, auto-launch image viewer, then pause for Y/N.
     Returns True if approved.
     """
     output_dir = stl_path.parent
     pngs = _render_previews(stl_path, output_dir)
+
+    # Pop open the image viewer before the prompt — non-blocking
+    _open_previews(pngs)
 
     print()
     print("=" * 60)
@@ -521,12 +563,10 @@ def _human_review(stl_path: Path, gcode_path: Path, validation: dict) -> bool:
     print("=" * 60)
     print()
     if pngs:
-        print("  Preview images (open in Cursor or any image viewer):")
-        for p in pngs:
-            print(f"    {p}")
+        print("  3 render views are open in EOG — perspective, top, front.")
+        print("  Use arrow keys in EOG to switch between views.")
     else:
         print(f"  STL (3D model):  {stl_path}")
-        print(f"  (open with:  freecad {stl_path})")
     print()
     print(f"  G-code:  {gcode_path}")
     print(f"  (view:   cat {gcode_path})")
