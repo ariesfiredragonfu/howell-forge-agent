@@ -208,6 +208,7 @@ def generate_post(
     dry_run: bool = False,
     likes: int = 0,
     replies: int = 0,
+    retweets: int = 0,
     _now_ts: Optional[float] = None,
 ) -> dict:
     """
@@ -221,6 +222,7 @@ def generate_post(
     Args:
         likes:    First-hour like count from X API (pass 0 if not yet available).
         replies:  First-hour reply count from X API (pass 0 if not yet available).
+        retweets: First-hour retweet count from X API (pass 0 if not yet available).
         _now_ts:  Unix timestamp override — for deterministic tests only.
 
     Returns result dict with keys: approved, budget, published, reason.
@@ -278,10 +280,10 @@ def generate_post(
     )
 
     # First-hour engagement reward — populated by X API callback
-    if likes > 50 or replies > 10:
+    if likes > 50 or replies > 10 or retweets > 5:
         biofeedback.append_reward(
             "HERALD",
-            f"High X engagement — likes={likes} replies={replies}",
+            f"High X engagement — likes={likes} replies={replies} retweets={retweets}",
             kpi="x_engagement_high",
             event_type="x_engagement_high",
         )

@@ -226,19 +226,48 @@ def test_generate_post_high_engagement() -> None:
     reset_ewma()
 
     mock_validation = {"approved": True, "reason": "OK", "data": {}}
+    _budget = {"posts_allowed": None, "reason": "normal", "throttled": False, "healing_active": False}
 
+    # likes > 50
     with (
         patch.object(mkt, "validate_post", return_value=mock_validation),
         patch.object(mkt, "append_log", lambda *a, **kw: None),
-        patch.object(mkt, "check_herald_budget", return_value={"posts_allowed": None, "reason": "normal", "throttled": False, "healing_active": False}),
+        patch.object(mkt, "check_herald_budget", return_value=_budget),
     ):
         mkt.generate_post("Herald (Social Post)", "Steel post.", likes=75, replies=5)
 
     state = bf.get_ewma_state()
-    # seo_pass (+1.0) + x_engagement_high (+2.0) = 3.0 from zero
-    check("Score reflects seo_pass + x_engagement_high",
+    check("Score reflects seo_pass + x_engagement_high (likes>50)",
           state["current_score"] >= 2.9,
           f"score={state['current_score']:.4f} expected≥2.9")
+
+    # retweets > 5 (new threshold)
+    reset_ewma()
+    with (
+        patch.object(mkt, "validate_post", return_value=mock_validation),
+        patch.object(mkt, "append_log", lambda *a, **kw: None),
+        patch.object(mkt, "check_herald_budget", return_value=_budget),
+    ):
+        mkt.generate_post("Herald (Social Post)", "Steel post.", likes=0, replies=0, retweets=8)
+
+    state = bf.get_ewma_state()
+    check("Score reflects seo_pass + x_engagement_high (retweets>5)",
+          state["current_score"] >= 2.9,
+          f"score={state['current_score']:.4f} expected≥2.9")
+
+    # under all thresholds — no x_engagement_high
+    reset_ewma()
+    with (
+        patch.object(mkt, "validate_post", return_value=mock_validation),
+        patch.object(mkt, "append_log", lambda *a, **kw: None),
+        patch.object(mkt, "check_herald_budget", return_value=_budget),
+    ):
+        mkt.generate_post("Herald (Social Post)", "Steel post.", likes=5, replies=2, retweets=1)
+
+    state = bf.get_ewma_state()
+    check("Score is seo_pass only when under all engagement thresholds",
+          abs(state["current_score"] - 1.0) < 0.01,
+          f"score={state['current_score']:.4f} expected=1.0")
 
 
 # ─── Test 8: generate_post validation fail ───────────────────────────────────
