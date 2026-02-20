@@ -121,6 +121,17 @@ class AbstractDatabaseInterface(ABC):
         """Return all feature records as a list of dicts."""
         ...
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def close(self) -> None:
+        """
+        Release all resources held by this backend (connections, pools, etc.).
+        Called automatically by set_backend() before the old backend is replaced.
+        Implementations must be idempotent — calling close() twice is safe.
+        """
+        ...
+
     # ── Security Events ───────────────────────────────────────────────────────
 
     @abstractmethod
@@ -465,6 +476,19 @@ class SQLiteBackend(AbstractDatabaseInterface):
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """
+        No-op for SQLiteBackend: _conn() opens a fresh connection per call and
+        closes it via the context manager, so there is no persistent connection
+        to release.  Implemented here to satisfy the abstract interface so that
+        set_backend() can call close() unconditionally on any backend type.
+
+        If you subclass SQLiteBackend with a connection pool, override this.
+        """
+        pass
+
 
 # ─── Backend Registry ─────────────────────────────────────────────────────────
 
@@ -480,10 +504,13 @@ def set_backend(backend: AbstractDatabaseInterface) -> None:
     """
     Swap the active backend at runtime.
 
+    Calls close() on the outgoing backend before replacing it so connections,
+    file handles, and thread pools are released cleanly (Grok refinement).
+
     Example — switch to a hypothetical Redis backend:
         from eliza_db import set_backend
         from my_redis_backend import RedisBackend
-        set_backend(RedisBackend(url="redis://localhost:6379"))
+        set_backend(RedisBackend(url="redis://localhost:6379/0"))
     """
     global _backend
     if not isinstance(backend, AbstractDatabaseInterface):
@@ -491,4 +518,89 @@ def set_backend(backend: AbstractDatabaseInterface) -> None:
             f"Backend must be an AbstractDatabaseInterface subclass, "
             f"got {type(backend).__name__}"
         )
+    try:
+        _backend.close()  # release old backend resources before swap
+    except Exception:
+        pass  # never let teardown failure block the swap
     _backend = backend
+
+
+def init_db() -> None:
+    """
+    Initialise the database backend from eliza-config.json.
+
+    Called once at process startup (e.g. from run_order_loop.py or run_agents.py).
+    Reads the "database" block from eliza-config.json; if absent, keeps the
+    default SQLiteBackend.
+
+    Supported config shape:
+        {
+          "database": {
+            "backend": "sqlite" | "redis",
+            "sqlite": { "db_path": "~/.config/howell-forge-eliza.db" },
+            "redis":  { "url": "redis://localhost:6379/0" }
+          }
+        }
+
+    When backend = "redis", imports redis lazily so the package is only
+    required when actually needed (zero import cost for SQLite-only deployments).
+    """
+    import json as _json
+    config_path = Path(__file__).parent / "eliza-config.json"
+    try:
+        cfg = _json.loads(config_path.read_text()).get("database", {})
+    except (OSError, _json.JSONDecodeError):
+        return  # no config → keep default SQLiteBackend
+
+    backend_type = cfg.get("backend", "sqlite").lower()
+
+    if backend_type == "redis":
+        redis_cfg = cfg.get("redis", {})
+        url = redis_cfg.get("url", "redis://localhost:6379/0")
+        try:
+            import redis as _redis  # lazy import — only when Redis is configured
+            import json as _json2
+
+            class _RedisBackend(AbstractDatabaseInterface):
+                """
+                Minimal Redis backend wired up from init_db().
+                Replace with a full implementation (redis_backend.py) when ready.
+                Raises NotImplementedError for all methods until you implement them.
+                """
+                def __init__(self, redis_url: str):
+                    self._client = _redis.from_url(redis_url, decode_responses=True)
+
+                def close(self) -> None:
+                    self._client.close()
+
+                def _ni(self, name: str):
+                    raise NotImplementedError(
+                        f"RedisBackend.{name}() not yet implemented. "
+                        f"Create redis_backend.py and call set_backend(RedisBackend(...))."
+                    )
+
+                def remember(self, *a, **kw): self._ni("remember")
+                def recall(self, *a, **kw): self._ni("recall")
+                def upsert_order(self, *a, **kw): self._ni("upsert_order")
+                def get_order(self, *a, **kw): self._ni("get_order")
+                def find_orders_by_email(self, *a, **kw): self._ni("find_orders_by_email")
+                def get_pending_orders(self, *a, **kw): self._ni("get_pending_orders")
+                def get_feature_status(self, *a, **kw): self._ni("get_feature_status")
+                def set_feature_status(self, *a, **kw): self._ni("set_feature_status")
+                def get_all_features(self, *a, **kw): self._ni("get_all_features")
+                def log_security_event(self, *a, **kw): self._ni("log_security_event")
+                def count_security_events(self, *a, **kw): self._ni("count_security_events")
+                def get_recent_security_events(self, *a, **kw): self._ni("get_recent_security_events")
+
+            set_backend(_RedisBackend(url))
+            print(f"[eliza_db] Redis backend initialised ({url})")
+        except ImportError:
+            print("[eliza_db] WARNING: backend=redis configured but redis package not installed. "
+                  "Falling back to SQLiteBackend. Run: pip install redis")
+
+    elif backend_type == "sqlite":
+        sqlite_cfg = cfg.get("sqlite", {})
+        db_path_str = sqlite_cfg.get("db_path", str(_DEFAULT_DB_PATH))
+        db_path = Path(db_path_str.replace("~", str(Path.home())))
+        set_backend(SQLiteBackend(db_path=db_path))
+        print(f"[eliza_db] SQLite backend initialised ({db_path})")
