@@ -11,6 +11,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -24,7 +25,10 @@ LOG_PATH = Path.home() / "project_docs" / "howell-forge-website-log.md"
 BASE_URL = "https://howell-forge.com"
 HOST = "howell-forge.com"
 CONFIG_PATH = Path(__file__).parent / "eliza-config.json"
-SCALE_STATE_PATH = Path.home() / "project_docs" / "biofeedback" / "scale_state.json"
+SCALE_STATE_PATH   = Path.home() / "project_docs" / "biofeedback" / "scale_state.json"
+_BURST_LOG_PATH    = Path.home() / "project_docs" / "biofeedback" / "herald_post_times.json"
+_BURST_WINDOW_SEC  = 3600   # sliding 1-hour window
+_BURST_LIMIT       = 3      # >3 posts in window → x_bot_risk
 
 # Off-brand / content-safety blocklist (case-insensitive).
 OFF_BRAND_BLOCKLIST = [
@@ -49,6 +53,31 @@ def _load_scale_state() -> dict:
         return json.loads(SCALE_STATE_PATH.read_text())
     except (OSError, json.JSONDecodeError):
         return {"mode": "normal", "score": 0.0}
+
+
+# ─── Herald burst detection ───────────────────────────────────────────────────
+
+def _load_post_times() -> list[float]:
+    try:
+        return json.loads(_BURST_LOG_PATH.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+
+
+def _record_post_timestamp(_now_ts: Optional[float] = None) -> None:
+    """Append current Unix timestamp; prune entries outside the burst window."""
+    now = _now_ts if _now_ts is not None else time.time()
+    times = [t for t in _load_post_times() if now - t < _BURST_WINDOW_SEC]
+    times.append(now)
+    _BURST_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _BURST_LOG_PATH.write_text(json.dumps(times))
+
+
+def _detect_burst(_now_ts: Optional[float] = None) -> bool:
+    """Return True if _BURST_LIMIT or more posts were published in the last hour."""
+    now = _now_ts if _now_ts is not None else time.time()
+    recent = [t for t in _load_post_times() if now - t < _BURST_WINDOW_SEC]
+    return len(recent) >= _BURST_LIMIT
 
 
 # ─── Herald Budget ────────────────────────────────────────────────────────────
@@ -177,12 +206,22 @@ def generate_post(
     draft_text: str,
     agent: str = "HERALD_AGENT",
     dry_run: bool = False,
+    likes: int = 0,
+    replies: int = 0,
+    _now_ts: Optional[float] = None,
 ) -> dict:
     """
     Full Herald post pipeline:
       1. Check budget (throttle / healing detection)
-      2. Call validate_post() — VALIDATE_FEATURE pre-post hook
-      3. If approved + budget allows → "publish" (log + Telegram)
+      2. Burst detection — >3 posts/hour triggers x_bot_risk constraint
+      3. VALIDATE_FEATURE pre-post hook (entity whitelist + feature status)
+      4. If approved → publish, emit seo_pass reward
+      5. First-hour engagement check → emit x_engagement_high if likes>50 or replies>10
+
+    Args:
+        likes:    First-hour like count from X API (pass 0 if not yet available).
+        replies:  First-hour reply count from X API (pass 0 if not yet available).
+        _now_ts:  Unix timestamp override — for deterministic tests only.
 
     Returns result dict with keys: approved, budget, published, reason.
     """
@@ -196,13 +235,30 @@ def generate_post(
             "reason": "dry_run",
         }
 
+    # ── Burst check ───────────────────────────────────────────────────────────
+    burst_detected = _detect_burst(_now_ts=_now_ts)
+    if burst_detected:
+        biofeedback.append_constraint(
+            "HERALD",
+            f"Burst detected — ≥{_BURST_LIMIT} posts in 1 hour; x_bot_risk triggered",
+            event_type="x_bot_risk",
+        )
+        append_log("HIGH", f"Herald burst detected: ≥{_BURST_LIMIT} posts/hour — post blocked")
+        return {
+            "approved": False,
+            "budget": budget,
+            "published": False,
+            "reason": "burst_detected",
+        }
+
+    # ── VALIDATE_FEATURE ──────────────────────────────────────────────────────
     validation = validate_post(feature_name, draft_text, agent=agent)
 
     if not validation["approved"]:
         biofeedback.append_constraint(
-            "MARKETING",
+            "HERALD",
             f"Herald post blocked — {validation['reason']}",
-            event_type="marketing_fail",
+            event_type="marketing_validation_fail",
         )
         append_log("HIGH", f"Herald post blocked: {validation['reason']}")
         return {
@@ -212,13 +268,24 @@ def generate_post(
             "reason": validation["reason"],
         }
 
-    # Post is valid — simulate publish (real X API goes here)
+    # ── Publish ───────────────────────────────────────────────────────────────
+    _record_post_timestamp(_now_ts=_now_ts)
     biofeedback.append_reward(
-        "MARKETING",
-        f"Herald post approved: '{draft_text[:60]}…'",
-        kpi="herald_post",
-        event_type="marketing_pass",
+        "HERALD",
+        f"Herald post live: '{draft_text[:60]}…'",
+        kpi="seo_pass",
+        event_type="seo_pass",
     )
+
+    # First-hour engagement reward — populated by X API callback
+    if likes > 50 or replies > 10:
+        biofeedback.append_reward(
+            "HERALD",
+            f"High X engagement — likes={likes} replies={replies}",
+            kpi="x_engagement_high",
+            event_type="x_engagement_high",
+        )
+
     append_log("INFO", f"Herald post approved + published: {draft_text[:120]}")
 
     return {
@@ -366,7 +433,7 @@ def main() -> int:
     ok = seo_ok and brand_ok
 
     if ok:
-        biofeedback.append_reward("MARKETING", "SEO + brand check passed", kpi="SEO")
+        biofeedback.append_reward("MARKETING", "SEO + brand check passed", kpi="SEO", event_type="seo_pass")
         print(f"Marketing: {BASE_URL} OK (title, meta description, brand safe)")
         return 0
 

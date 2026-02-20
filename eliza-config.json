@@ -277,6 +277,14 @@
       "high": 3.0,
       "throttle": -2.0
     },
-    "_comment": "Set use_ewma: false to fall back to simple event-count scoring (rewards - constraints)"
+    "_comment": "Set use_ewma: false to fall back to simple event-count scoring (rewards - constraints)",
+    "reward_types": {
+      "seo_pass": 1.0,
+      "x_engagement_high": 2.0
+    },
+    "constraint_types": {
+      "marketing_validation_fail": 1.0,
+      "x_bot_risk": 0.5
+    }
   }
 }

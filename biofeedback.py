@@ -76,15 +76,20 @@ SCORE_FLOOR    = -10.0
 
 # Directive-specified weights + sensible defaults for the full event set
 EVENT_WEIGHTS: dict[str, float] = {
-    "security_pass":  3.0,
-    "security_fail":  -2.0,
-    "marketing_pass": 1.0,
-    "marketing_fail": -1.0,   # directive weight
-    "monitor_pass":   1.0,
-    "monitor_fail":   -2.0,
-    "order_success":  1.0,
-    "order_fail":     -1.0,
-    "circuit_open":   -3.0,   # Kaito circuit breaker opened
+    "security_pass":            3.0,
+    "security_fail":           -2.0,
+    "marketing_pass":           1.0,
+    "marketing_fail":          -1.0,
+    "monitor_pass":             1.0,
+    "monitor_fail":            -2.0,
+    "order_success":            1.0,
+    "order_fail":              -1.0,
+    "circuit_open":            -3.0,   # Kaito circuit breaker opened
+    # Herald / X (Twitter) signals
+    "seo_pass":                 1.0,   # SEO check passes (distinct from generic marketing_pass)
+    "x_engagement_high":        2.0,   # X post hits high engagement threshold
+    "marketing_validation_fail":-1.0,  # Herald content validation failure
+    "x_bot_risk":              -0.5,   # X post flagged for bot-risk patterns
 }
 
 
