@@ -538,12 +538,17 @@ def init_db() -> None:
           "database": {
             "backend": "sqlite" | "redis",
             "sqlite": { "db_path": "~/.config/howell-forge-eliza.db" },
-            "redis":  { "url": "redis://localhost:6379/0" }
+            "redis":  {
+              "url":             "redis://localhost:6379/0",
+              "max_connections": 50,
+              "socket_timeout":  5.0
+            }
           }
         }
 
-    When backend = "redis", imports redis lazily so the package is only
-    required when actually needed (zero import cost for SQLite-only deployments).
+    When backend = "redis", imports redis_backend.RedisBackend lazily so the
+    package is only required when actually needed (zero import cost for
+    SQLite-only deployments).
     """
     import json as _json
     config_path = Path(__file__).parent / "eliza-config.json"
@@ -556,47 +561,22 @@ def init_db() -> None:
 
     if backend_type == "redis":
         redis_cfg = cfg.get("redis", {})
-        url = redis_cfg.get("url", "redis://localhost:6379/0")
+        url              = redis_cfg.get("url",             "redis://localhost:6379/0")
+        max_connections  = redis_cfg.get("max_connections", 50)
+        socket_timeout   = redis_cfg.get("socket_timeout",  5.0)
         try:
-            import redis as _redis  # lazy import — only when Redis is configured
-            import json as _json2
-
-            class _RedisBackend(AbstractDatabaseInterface):
-                """
-                Minimal Redis backend wired up from init_db().
-                Replace with a full implementation (redis_backend.py) when ready.
-                Raises NotImplementedError for all methods until you implement them.
-                """
-                def __init__(self, redis_url: str):
-                    self._client = _redis.from_url(redis_url, decode_responses=True)
-
-                def close(self) -> None:
-                    self._client.close()
-
-                def _ni(self, name: str):
-                    raise NotImplementedError(
-                        f"RedisBackend.{name}() not yet implemented. "
-                        f"Create redis_backend.py and call set_backend(RedisBackend(...))."
-                    )
-
-                def remember(self, *a, **kw): self._ni("remember")
-                def recall(self, *a, **kw): self._ni("recall")
-                def upsert_order(self, *a, **kw): self._ni("upsert_order")
-                def get_order(self, *a, **kw): self._ni("get_order")
-                def find_orders_by_email(self, *a, **kw): self._ni("find_orders_by_email")
-                def get_pending_orders(self, *a, **kw): self._ni("get_pending_orders")
-                def get_feature_status(self, *a, **kw): self._ni("get_feature_status")
-                def set_feature_status(self, *a, **kw): self._ni("set_feature_status")
-                def get_all_features(self, *a, **kw): self._ni("get_all_features")
-                def log_security_event(self, *a, **kw): self._ni("log_security_event")
-                def count_security_events(self, *a, **kw): self._ni("count_security_events")
-                def get_recent_security_events(self, *a, **kw): self._ni("get_recent_security_events")
-
-            set_backend(_RedisBackend(url))
-            print(f"[eliza_db] Redis backend initialised ({url})")
-        except ImportError:
-            print("[eliza_db] WARNING: backend=redis configured but redis package not installed. "
-                  "Falling back to SQLiteBackend. Run: pip install redis")
+            from redis_backend import RedisBackend  # lazy import
+            set_backend(RedisBackend(
+                url=url,
+                max_connections=max_connections,
+                socket_timeout=socket_timeout,
+            ))
+            print(f"[eliza_db] Redis backend initialised ({url}, pool={max_connections})")
+        except ImportError as exc:
+            print(
+                f"[eliza_db] WARNING: backend=redis configured but import failed ({exc}). "
+                "Falling back to SQLiteBackend. Run: pip install redis"
+            )
 
     elif backend_type == "sqlite":
         sqlite_cfg = cfg.get("sqlite", {})
