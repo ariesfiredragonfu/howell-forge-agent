@@ -1,0 +1,153 @@
+{
+  "project": "howell-forge-order-loop",
+  "version": "2.0.0",
+  "description": "ElizaOS Order Loop — Howell Forge Shop + Customer Service agents",
+
+  "runtime": {
+    "python": "3.12",
+    "agent_dir": "~/howell-forge-agent",
+    "log_dir": "~/project_docs",
+    "db_path": "~/.config/howell-forge-eliza.db"
+  },
+
+  "memory": {
+    "adapter": "sqlite",
+    "db_path": "~/.config/howell-forge-eliza.db",
+    "tables": {
+      "memories": "memories",
+      "orders":   "orders",
+      "security_events": "security_events"
+    },
+    "module": "eliza_memory"
+  },
+
+  "providers": [
+    {
+      "name": "ORDER_STATE",
+      "module": "eliza_providers",
+      "class": "OrderStateProvider",
+      "description": "Real-time order state — shared by Shop Agent and Customer Service Agent",
+      "consumers": ["SHOP_AGENT", "CUSTOMER_SERVICE_AGENT"]
+    },
+    {
+      "name": "SECURITY_CONTEXT",
+      "module": "eliza_providers",
+      "class": "SecurityContextProvider",
+      "description": "Recent security events — consumed by Monitor Agent",
+      "consumers": ["MONITOR_AGENT", "CUSTOMER_SERVICE_AGENT"]
+    }
+  ],
+
+  "actions": [
+    {
+      "name": "VERIFY_PAYMENT",
+      "module": "eliza_actions",
+      "class": "VerifyPaymentAction",
+      "description": "Query Kaito for on-chain payment status. Transitions order to PAID.",
+      "triggered_by": "SHOP_AGENT",
+      "unlocks": "delivery_info",
+      "logs_to": "fortress_errors.log"
+    },
+    {
+      "name": "REFRESH_PAYMENT",
+      "module": "eliza_actions",
+      "class": "RefreshPaymentAction",
+      "description": "Force-refresh a stuck Pending order. Triggered by Customer Service Agent.",
+      "triggered_by": "CUSTOMER_SERVICE_AGENT",
+      "logs_to": "fortress_errors.log"
+    },
+    {
+      "name": "IMPORT_ORDER",
+      "module": "eliza_actions",
+      "class": "ImportOrderAction",
+      "description": "Import a Stripe-confirmed order as PAID.",
+      "triggered_by": "SHOP_AGENT",
+      "logs_to": "fortress_errors.log"
+    }
+  ],
+
+  "agents": {
+    "shop_agent": {
+      "module": "shop_agent",
+      "entry": "process_order",
+      "queue": {
+        "module": "order_queue",
+        "class": "OrderQueue",
+        "workers": 3,
+        "max_workers": 5,
+        "retry_max": 3,
+        "payment_poll_interval_sec": 10,
+        "payment_timeout_sec": 3600
+      },
+      "uses_providers": ["ORDER_STATE"],
+      "uses_actions": ["VERIFY_PAYMENT", "IMPORT_ORDER"],
+      "writes_memory": true,
+      "reads_memory": true
+    },
+    "customer_service_agent": {
+      "module": "customer_service_agent",
+      "entry": "where_is_my_order",
+      "uses_providers": ["ORDER_STATE", "SECURITY_CONTEXT"],
+      "uses_actions": ["REFRESH_PAYMENT"],
+      "writes_memory": false,
+      "reads_memory": true,
+      "delivery_gate": "PAID"
+    },
+    "monitor_agent": {
+      "module": "monitor",
+      "entry": "main",
+      "uses_providers": ["SECURITY_CONTEXT"],
+      "reads_fortress_log": "~/project_docs/fortress_errors.log",
+      "self_healing_threshold": 3,
+      "self_healing_window_min": 30
+    }
+  },
+
+  "kaito": {
+    "config_file": "~/.config/cursor-kaito-config",
+    "module": "kaito_engine",
+    "dev_mode": true,
+    "networks_supported": ["polygon", "ethereum", "solana"],
+    "default_network": "polygon",
+    "payment_status_values": ["Confirmed", "Pending", "Failed", "Expired"]
+  },
+
+  "order_status_machine": {
+    "states": ["Pending", "Processing", "PAID", "Success", "Failed", "Expired"],
+    "initial": "Pending",
+    "terminal": ["PAID", "Success", "Failed", "Expired"],
+    "delivery_unlocked_by": ["PAID", "Success"],
+    "transitions": {
+      "Pending":    ["PAID", "Failed", "Expired", "Pending"],
+      "Processing": ["PAID", "Failed", "Expired"],
+      "PAID":       [],
+      "Success":    [],
+      "Failed":     [],
+      "Expired":    []
+    }
+  },
+
+  "security": {
+    "fortress_log": "~/project_docs/fortress_errors.log",
+    "security_hooks_module": "security_hooks",
+    "auth_error_threshold": 3,
+    "auth_error_window_min": 30,
+    "failed_tx_threshold": 5,
+    "failed_tx_window_min": 60,
+    "self_healing_action": "rotate_credentials_alert"
+  },
+
+  "notifications": {
+    "module": "notifications",
+    "provider": "telegram_via_zapier",
+    "config_file": "~/.config/cursor-zapier-telegram-webhook"
+  },
+
+  "orchestrator": {
+    "module": "run_order_loop",
+    "daemon_entry": "daemon_loop",
+    "sync_interval_sec": 60,
+    "stripe_sync_limit": 20,
+    "run_agents_module": "run_agents"
+  }
+}
