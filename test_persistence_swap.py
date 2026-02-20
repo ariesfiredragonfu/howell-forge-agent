@@ -262,6 +262,15 @@ def test_publish_order_paid_facade():
         _check("Publish order_id correct",                 payload["order_id"] == "ORDER-PUB-001")
         _check("Publish data.amount_usd correct",          payload["data"]["amount_usd"] == 99.00)
 
+        # Timestamp must be ISO 8601 with timezone offset (not the custom "UTC" suffix)
+        ts_str = payload.get("timestamp", "")
+        try:
+            from datetime import datetime as _dt
+            parsed = _dt.fromisoformat(ts_str)
+            _check("Publish timestamp is ISO 8601 with tz offset", parsed.tzinfo is not None, ts_str)
+        except ValueError:
+            _check("Publish timestamp is ISO 8601 with tz offset", False, repr(ts_str))
+
     set_backend(SQLiteBackend())   # restore for subsequent tests
 
 

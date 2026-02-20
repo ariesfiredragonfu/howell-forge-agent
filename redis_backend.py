@@ -455,10 +455,10 @@ class RedisBackend(AbstractDatabaseInterface):
         """
         channel = self._k("order_events")
         payload = json.dumps({
-            "type":     event_type,
-            "order_id": order_id,
-            "data":     data,
-            "ts":       self._now_iso(),
+            "type":      event_type,
+            "order_id":  order_id,
+            "data":      data,
+            "timestamp": datetime.now(timezone.utc).isoformat(),  # ISO 8601 + tz offset
         })
         self.client.publish(channel, payload)
 
