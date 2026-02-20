@@ -44,6 +44,7 @@ import biofeedback
 import eliza_memory
 import kaito_engine
 import security_hooks
+from eliza_db import get_db
 from eliza_memory import AgentState, get_agent_state
 from notifications import send_telegram_alert
 
@@ -570,8 +571,194 @@ class ImportOrderAction(Action):
         )
 
 
+# ─── ValidationError ──────────────────────────────────────────────────────────
+
+
+class ValidationError(Exception):
+    """
+    Raised by ValidateFeatureAction when a feature is not LIVE or the
+    proposed post text fails the entity whitelist check.
+
+    Attributes:
+        reason        short machine-readable reason code
+        feature_name  the feature that was queried
+        status        current feature status (DEV/BETA/LIVE/DEPRECATED)
+    """
+
+    def __init__(
+        self,
+        message: str,
+        reason: str = "unknown",
+        feature_name: Optional[str] = None,
+        status: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.feature_name = feature_name
+        self.status = status
+
+
+# ─── ValidateFeatureAction ────────────────────────────────────────────────────
+
+_CONFIG_PATH = Path(__file__).parent / "eliza-config.json"
+
+
+def _load_entity_whitelist() -> list[str]:
+    """
+    Load the entity whitelist from eliza-config.json herald.entity_whitelist.
+    Falls back to an empty list so the action passes when no config exists.
+
+    No spacy/nltk required — the whitelist is a list of brand / product terms
+    that must appear in the proposed text (≥80% match by count).  When spacy
+    becomes a project dependency this function can be upgraded to extract named
+    entities from the text and match them against the whitelist.
+    """
+    try:
+        cfg = json.loads(_CONFIG_PATH.read_text())
+        return cfg.get("herald", {}).get("entity_whitelist", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _entity_match_score(text: str, whitelist: list[str]) -> float:
+    """
+    Fraction of whitelist terms that appear in the text (case-insensitive).
+    A term matches if it appears as a substring of the lowercased text.
+    Returns 1.0 when whitelist is empty (no constraint to enforce).
+    """
+    if not whitelist:
+        return 1.0
+    text_lower = text.lower()
+    matches = sum(1 for term in whitelist if term.lower() in text_lower)
+    return matches / len(whitelist)
+
+
+class ValidateFeatureAction(Action):
+    """
+    Gate any X / social post on:
+      1. Feature status = LIVE  (rejects DEV/BETA/DEPRECATED)
+      2. Entity whitelist match ≥ 80%  (guards brand safety / Drift fix)
+
+    On rejection:
+      - Raises ValidationError (caller must catch)
+      - Logs a constraint to biofeedback (Marketing: Validation Denied)
+      - Writes a breadcrumb to fortress_errors.log
+
+    context keys required:
+      feature_name        str   feature to gate on (must be LIVE)
+      proposed_post_text  str   draft post copy to validate
+    """
+
+    name = "VALIDATE_FEATURE"
+    description = (
+        "Gate Herald posts on feature status (must be LIVE) "
+        "and entity whitelist match (≥80%). "
+        "Raises ValidationError on any failure."
+    )
+
+    ENTITY_MATCH_THRESHOLD: float = 0.80
+
+    def _validate(self, state: AgentState, context: dict) -> bool:
+        return bool(context.get("feature_name")) and bool(context.get("proposed_post_text"))
+
+    async def _handler(
+        self, state: AgentState, context: dict, options: dict
+    ) -> ActionResult:
+        feature_name: str = context["feature_name"]
+        proposed_text: str = context["proposed_post_text"]
+        agent: str = context.get("agent", "HERALD_AGENT")
+
+        # ── 1. Feature status gate ─────────────────────────────────────────
+        status: Optional[str] = get_db().get_feature_status(feature_name)
+
+        if status is None:
+            msg = f"Feature '{feature_name}' not found in feature_states table"
+            biofeedback.append_constraint(
+                "MARKETING",
+                f"Validation Denied: {feature_name} — unknown feature",
+                event_type="marketing_fail",
+            )
+            log_action_error(
+                self.name, agent, None,
+                ValidationError(msg, reason="feature_unknown", feature_name=feature_name),
+                extra={"feature_name": feature_name, "proposed_status": None},
+            )
+            raise ValidationError(msg, reason="feature_unknown", feature_name=feature_name)
+
+        if status != "LIVE":
+            msg = (
+                f"Feature '{feature_name}' is {status} — "
+                f"posts only allowed when status = LIVE"
+            )
+            biofeedback.append_constraint(
+                "MARKETING",
+                f"Validation Denied: {feature_name} is {status} (not LIVE)",
+                event_type="marketing_fail",
+            )
+            log_action_error(
+                self.name, agent, None,
+                ValidationError(msg, reason="feature_not_live",
+                                feature_name=feature_name, status=status),
+                extra={"feature_name": feature_name, "current_status": status},
+            )
+            raise ValidationError(
+                msg, reason="feature_not_live",
+                feature_name=feature_name, status=status,
+            )
+
+        # ── 2. Entity whitelist check ──────────────────────────────────────
+        whitelist = _load_entity_whitelist()
+        score = _entity_match_score(proposed_text, whitelist)
+
+        if score < self.ENTITY_MATCH_THRESHOLD:
+            pct = int(score * 100)
+            threshold_pct = int(self.ENTITY_MATCH_THRESHOLD * 100)
+            missing = [t for t in whitelist if t.lower() not in proposed_text.lower()]
+            msg = (
+                f"Entity density {pct}% < {threshold_pct}% threshold. "
+                f"Missing terms: {missing}"
+            )
+            biofeedback.append_constraint(
+                "MARKETING",
+                f"Validation Denied: entity density {pct}% < {threshold_pct}% for '{feature_name}'",
+                event_type="marketing_fail",
+            )
+            log_action_error(
+                self.name, agent, None,
+                ValidationError(msg, reason="entity_density_low",
+                                feature_name=feature_name, status=status),
+                extra={
+                    "feature_name": feature_name,
+                    "entity_match_pct": pct,
+                    "threshold_pct": threshold_pct,
+                    "missing_entities": missing,
+                },
+            )
+            raise ValidationError(
+                msg, reason="entity_density_low",
+                feature_name=feature_name, status=status,
+            )
+
+        # ── Pass ──────────────────────────────────────────────────────────
+        return ActionResult(
+            success=True,
+            status="VALIDATED",
+            message=(
+                f"Feature '{feature_name}' is LIVE. "
+                f"Entity match: {int(score * 100)}%. Post approved."
+            ),
+            data={
+                "feature_name": feature_name,
+                "feature_status": status,
+                "entity_match_pct": int(score * 100),
+                "whitelist_used": whitelist,
+            },
+        )
+
+
 # ─── Module-level singletons ──────────────────────────────────────────────────
 
 verify_payment = VerifyPaymentAction()
 refresh_payment = RefreshPaymentAction()
 import_order = ImportOrderAction()
+validate_feature = ValidateFeatureAction()

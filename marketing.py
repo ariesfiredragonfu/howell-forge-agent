@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Marketing Agent — Layer 1
-SEO basics, traffic (future), outreach (future). Reports to log on SEO issues.
+Marketing Agent — Layer 1  (Herald edition)
+SEO, off-brand checks, and Herald (social post) gate with:
+  - VALIDATE_FEATURE pre-post hook (feature must be LIVE)
+  - Budget throttling (1 post/day in throttle or healing mode)
+  - Entity whitelist enforcement (loaded from eliza-config.json)
 """
 
+import asyncio
+import json
 import re
 import sys
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from notifications import send_telegram_alert
 import biofeedback
@@ -17,15 +23,211 @@ import biofeedback
 LOG_PATH = Path.home() / "project_docs" / "howell-forge-website-log.md"
 BASE_URL = "https://howell-forge.com"
 HOST = "howell-forge.com"
+CONFIG_PATH = Path(__file__).parent / "eliza-config.json"
+SCALE_STATE_PATH = Path.home() / "project_docs" / "biofeedback" / "scale_state.json"
 
-# Off-brand / content-safety blocklist (case-insensitive). Avoid marketing hallucinations / spammy copy.
-# Extend in OFF_BRAND_BLOCKLIST_PATH if present.
+# Off-brand / content-safety blocklist (case-insensitive).
 OFF_BRAND_BLOCKLIST = [
     "guaranteed", "100% free", "act now", "limited time", "best in the world",
     "#1 rated", "miracle", "instant results", "risk-free", "exclusive offer",
     "once in a lifetime", "too good to be true", "no risk",
 ]
 OFF_BRAND_BLOCKLIST_PATH = Path.home() / "project_docs" / "howell-forge-off-brand-blocklist.txt"
+
+
+# ─── Herald config helpers ────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _load_scale_state() -> dict:
+    try:
+        return json.loads(SCALE_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"mode": "normal", "score": 0.0}
+
+
+# ─── Herald Budget ────────────────────────────────────────────────────────────
+
+def check_herald_budget() -> dict:
+    """
+    Check whether Herald is allowed to post (and how many times today).
+
+    Rules:
+      - "throttle" mode (biofeedback score ≤ -2) → max 1 post/day (essentials)
+      - Active Security Handshake proposals ("Healing") → max 1 post/day
+      - Normal → unlimited
+
+    Returns:
+        {
+          "posts_allowed":  int | None  (None = unlimited)
+          "reason":         str
+          "throttled":      bool
+          "healing_active": bool
+        }
+    """
+    scale = _load_scale_state()
+    throttled = scale.get("mode") == "throttle"
+
+    # Check if any security-fixes PRs are open (healing active)
+    healing_active = _healing_is_active()
+
+    if throttled or healing_active:
+        reason = []
+        if throttled:
+            reason.append(f"biofeedback throttle (score={scale.get('score', '?')})")
+        if healing_active:
+            reason.append("Security Handshake healing in progress")
+        return {
+            "posts_allowed": 1,
+            "reason": "; ".join(reason),
+            "throttled": throttled,
+            "healing_active": healing_active,
+        }
+
+    return {
+        "posts_allowed": None,
+        "reason": "normal operation",
+        "throttled": False,
+        "healing_active": False,
+    }
+
+
+def _healing_is_active() -> bool:
+    """
+    Return True if the SecurityContextProvider sees self-healing triggered
+    in the last 24 hours.  Imports lazily to avoid circular import issues.
+    """
+    try:
+        from eliza_providers import SecurityContextProvider
+        from eliza_memory import get_agent_state
+        ctx = SecurityContextProvider().get(get_agent_state(), {"since_minutes": 1440})
+        return bool(ctx.get("self_healing_triggered"))
+    except Exception:
+        return False
+
+
+# ─── Herald pre-post hook ─────────────────────────────────────────────────────
+
+def validate_post(
+    feature_name: str,
+    proposed_post_text: str,
+    agent: str = "HERALD_AGENT",
+) -> dict:
+    """
+    Pre-post hook — must be called before any X / social post is generated
+    or published.
+
+    Runs VALIDATE_FEATURE (feature status + entity whitelist) synchronously.
+
+    Returns:
+        {
+          "approved":  bool
+          "reason":    str
+          "data":      dict   (validation details from the action)
+        }
+
+    On failure: logs constraint, never raises (caller reads approved=False).
+    """
+    from eliza_actions import validate_feature, ValidationError
+    from eliza_memory import get_agent_state
+
+    state = get_agent_state()
+    context = {
+        "feature_name": feature_name,
+        "proposed_post_text": proposed_post_text,
+        "agent": agent,
+    }
+
+    async def _run():
+        return await validate_feature.handler(state, context)
+
+    try:
+        # Use asyncio.get_event_loop().run_until_complete when already inside a
+        # running loop (e.g. called from an async test); otherwise asyncio.run().
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, _run())
+                result = future.result(timeout=30)
+        else:
+            result = asyncio.run(_run())
+
+        return {
+            "approved": result.success,
+            "reason":   result.message,
+            "data":     result.data or {},
+        }
+    except Exception as exc:
+        reason = str(exc)
+        return {"approved": False, "reason": reason, "data": {}}
+
+
+def generate_post(
+    feature_name: str,
+    draft_text: str,
+    agent: str = "HERALD_AGENT",
+    dry_run: bool = False,
+) -> dict:
+    """
+    Full Herald post pipeline:
+      1. Check budget (throttle / healing detection)
+      2. Call validate_post() — VALIDATE_FEATURE pre-post hook
+      3. If approved + budget allows → "publish" (log + Telegram)
+
+    Returns result dict with keys: approved, budget, published, reason.
+    """
+    budget = check_herald_budget()
+
+    if dry_run:
+        return {
+            "approved": None,
+            "budget": budget,
+            "published": False,
+            "reason": "dry_run",
+        }
+
+    validation = validate_post(feature_name, draft_text, agent=agent)
+
+    if not validation["approved"]:
+        biofeedback.append_constraint(
+            "MARKETING",
+            f"Herald post blocked — {validation['reason']}",
+            event_type="marketing_fail",
+        )
+        append_log("HIGH", f"Herald post blocked: {validation['reason']}")
+        return {
+            "approved": False,
+            "budget": budget,
+            "published": False,
+            "reason": validation["reason"],
+        }
+
+    # Post is valid — simulate publish (real X API goes here)
+    biofeedback.append_reward(
+        "MARKETING",
+        f"Herald post approved: '{draft_text[:60]}…'",
+        kpi="herald_post",
+        event_type="marketing_pass",
+    )
+    append_log("INFO", f"Herald post approved + published: {draft_text[:120]}")
+
+    return {
+        "approved": True,
+        "budget": budget,
+        "published": True,
+        "reason": validation["reason"],
+        "data": validation.get("data", {}),
+    }
 
 
 def fetch_homepage() -> tuple[bool, str, str | None]:

@@ -35,6 +35,13 @@
       "class": "SecurityContextProvider",
       "description": "Recent security events — consumed by Monitor Agent",
       "consumers": ["MONITOR_AGENT", "CUSTOMER_SERVICE_AGENT"]
+    },
+    {
+      "name": "FEATURE_STATUS",
+      "module": "eliza_providers",
+      "class": "FeatureStatusProvider",
+      "description": "Read-only feature gate status (DEV/BETA/LIVE/DEPRECATED) from feature_states table",
+      "consumers": ["HERALD_AGENT", "SHOP_AGENT", "CUSTOMER_SERVICE_AGENT"]
     }
   ],
 
@@ -63,8 +70,49 @@
       "description": "Import a Stripe-confirmed order as PAID.",
       "triggered_by": "SHOP_AGENT",
       "logs_to": "fortress_errors.log"
+    },
+    {
+      "name": "VALIDATE_FEATURE",
+      "module": "eliza_actions",
+      "class": "ValidateFeatureAction",
+      "description": "Gate Herald posts on feature status (LIVE only) + entity whitelist match ≥80%.",
+      "triggered_by": "HERALD_AGENT",
+      "raises": "ValidationError",
+      "logs_to": "fortress_errors.log"
     }
   ],
+
+  "herald": {
+    "description": "Social post agent — gates all posts through VALIDATE_FEATURE before generation",
+    "feature_gate": "Herald (Social Post)",
+    "budget": {
+      "normal_posts_per_day": null,
+      "throttle_posts_per_day": 1,
+      "healing_posts_per_day": 1,
+      "throttle_content": "essential_only"
+    },
+    "entity_whitelist": [
+      "Howell Forge",
+      "custom metalwork",
+      "handcrafted",
+      "fabrication",
+      "steel",
+      "made in USA"
+    ]
+  },
+
+  "feature_states": {
+    "table": "feature_states",
+    "seed": [
+      {"feature_name": "Kaito Payments",       "status": "DEV",  "description": "Polygon stablecoin payment processing"},
+      {"feature_name": "Order Loop",            "status": "BETA", "description": "Async priority queue for concurrent order processing"},
+      {"feature_name": "Security Handshake",    "status": "LIVE", "description": "fortress_watcher → security_agent → GitHub PR pipeline"},
+      {"feature_name": "Biofeedback Scaling",   "status": "LIVE", "description": "EWMA reward/constraint score driving deployment cadence"},
+      {"feature_name": "Customer Service Bot",  "status": "BETA", "description": "ElizaOS-native CS agent with PAID gate"},
+      {"feature_name": "Herald (Social Post)",  "status": "DEV",  "description": "X/social post generation with entity whitelist"},
+      {"feature_name": "Shop Manager",          "status": "DEV",  "description": "Order-to-production-to-ship workflow"}
+    ]
+  },
 
   "agents": {
     "shop_agent": {

@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import eliza_memory
+from eliza_db import get_db
 from eliza_memory import AgentState, get_agent_state
 
 # ─── Base ─────────────────────────────────────────────────────────────────────
@@ -283,8 +284,90 @@ def _build_delivery_info(order: dict) -> dict:
     }
 
 
+# ─── FeatureStatusProvider ────────────────────────────────────────────────────
+
+
+class FeatureStatusProvider(Provider):
+    """
+    Read-only view of the feature_states SQLite table.
+
+    Returns a snapshot of feature statuses so any agent can gate behaviour
+    on whether a feature is "LIVE" before acting on it.
+
+    Valid statuses: DEV | BETA | LIVE | DEPRECATED
+
+    context keys accepted:
+      feature_name  (str, optional) — return just that one feature
+      <none>                        — return all features as {name: status}
+
+    Return shape (single):
+        {
+          "feature_name": "Kaito Payments",
+          "status":       "DEV",
+          "description":  "...",
+          "last_updated": "...",
+          "is_live":      False
+        }
+
+    Return shape (all):
+        {
+          "features": {"Kaito Payments": "DEV", "Security Handshake": "LIVE", ...},
+          "live_features": ["Security Handshake", ...],
+          "total": 7
+        }
+    """
+
+    name = "FEATURE_STATUS"
+    description = "Feature gate status — read from feature_states table"
+
+    VALID_STATUSES: frozenset[str] = frozenset({"DEV", "BETA", "LIVE", "DEPRECATED"})
+
+    def _get(self, state: AgentState, context: dict) -> dict:
+        feature_name: Optional[str] = context.get("feature_name")
+
+        if feature_name:
+            return self._single_feature(feature_name)
+        return self._all_features()
+
+    def _single_feature(self, feature_name: str) -> dict:
+        all_rows = get_db().get_all_features()
+        row = next(
+            (r for r in all_rows if r["feature_name"] == feature_name),
+            None,
+        )
+        if row is None:
+            return {
+                "feature_name": feature_name,
+                "status": None,
+                "description": None,
+                "last_updated": None,
+                "is_live": False,
+                "found": False,
+            }
+        return {
+            "feature_name": row["feature_name"],
+            "status": row["status"],
+            "description": row.get("description"),
+            "last_updated": row.get("last_updated"),
+            "is_live": row["status"] == "LIVE",
+            "found": True,
+        }
+
+    def _all_features(self) -> dict:
+        rows = get_db().get_all_features()
+        feature_map = {r["feature_name"]: r["status"] for r in rows}
+        live = [r["feature_name"] for r in rows if r["status"] == "LIVE"]
+        return {
+            "features": feature_map,
+            "live_features": live,
+            "total": len(rows),
+            "rows": rows,
+        }
+
+
 # ─── Convenience singleton accessors ──────────────────────────────────────────
 
 # Module-level singletons — import and call .get() directly
 order_state = OrderStateProvider()
 security_context = SecurityContextProvider()
+feature_status = FeatureStatusProvider()

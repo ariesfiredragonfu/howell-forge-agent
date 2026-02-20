@@ -96,6 +96,31 @@ class AbstractDatabaseInterface(ABC):
         """Return all Pending orders. Oldest first."""
         ...
 
+    # ── Feature States ────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def get_feature_status(self, feature_name: str) -> Optional[str]:
+        """
+        Return the status string for a feature, or None if unknown.
+        Valid statuses: "DEV", "BETA", "LIVE", "DEPRECATED"
+        """
+        ...
+
+    @abstractmethod
+    def set_feature_status(
+        self,
+        feature_name: str,
+        status: str,
+        description: Optional[str] = None,
+    ) -> None:
+        """Upsert a feature's status record."""
+        ...
+
+    @abstractmethod
+    def get_all_features(self) -> list[dict]:
+        """Return all feature records as a list of dicts."""
+        ...
+
     # ── Security Events ───────────────────────────────────────────────────────
 
     @abstractmethod
@@ -159,6 +184,17 @@ class SQLiteBackend(AbstractDatabaseInterface):
     def _now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    # Seed data: features present at project start
+    _SEED_FEATURES: list[tuple[str, str, str]] = [
+        ("Kaito Payments",       "DEV",  "Polygon stablecoin payment processing via Kaito Finance"),
+        ("Order Loop",           "BETA", "Async priority queue for concurrent order processing"),
+        ("Security Handshake",   "LIVE", "fortress_watcher → security_agent → GitHub PR pipeline"),
+        ("Biofeedback Scaling",  "LIVE", "EWMA reward/constraint score driving deployment cadence"),
+        ("Customer Service Bot", "BETA", "ElizaOS-native CS agent with PAID gate"),
+        ("Herald (Social Post)", "DEV",  "X/social post generation with entity whitelist"),
+        ("Shop Manager",         "DEV",  "Order-to-production-to-ship workflow"),
+    ]
+
     def _init_db(self) -> None:
         with self._conn() as conn:
             conn.executescript("""
@@ -202,7 +238,21 @@ class SQLiteBackend(AbstractDatabaseInterface):
                     ON security_events (created_at);
                 CREATE INDEX IF NOT EXISTS idx_memories_type
                     ON memories (type, agent);
+
+                CREATE TABLE IF NOT EXISTS feature_states (
+                    feature_name  TEXT PRIMARY KEY,
+                    status        TEXT NOT NULL CHECK(status IN ('DEV','BETA','LIVE','DEPRECATED')),
+                    description   TEXT,
+                    last_updated  TEXT NOT NULL
+                );
             """)
+            # Seed feature states on first init (INSERT OR IGNORE = idempotent)
+            for name, status, desc in self._SEED_FEATURES:
+                conn.execute(
+                    "INSERT OR IGNORE INTO feature_states "
+                    "(feature_name, status, description, last_updated) VALUES (?,?,?,?)",
+                    (name, status, desc, self._now()),
+                )
 
     # ── Memory ────────────────────────────────────────────────────────────────
 
@@ -325,6 +375,40 @@ class SQLiteBackend(AbstractDatabaseInterface):
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM orders WHERE status = 'Pending' ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Feature States ────────────────────────────────────────────────────────
+
+    def get_feature_status(self, feature_name: str) -> Optional[str]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT status FROM feature_states WHERE feature_name = ?",
+                (feature_name,),
+            ).fetchone()
+        return row["status"] if row else None
+
+    def set_feature_status(
+        self,
+        feature_name: str,
+        status: str,
+        description: Optional[str] = None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO feature_states (feature_name, status, description, last_updated)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(feature_name) DO UPDATE SET
+                       status=excluded.status,
+                       description=COALESCE(excluded.description, description),
+                       last_updated=excluded.last_updated""",
+                (feature_name, status, description, self._now()),
+            )
+
+    def get_all_features(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM feature_states ORDER BY feature_name"
             ).fetchall()
         return [dict(r) for r in rows]
 
