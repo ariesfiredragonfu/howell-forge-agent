@@ -17,6 +17,7 @@ Run with a live Redis:
     python3 test_persistence_swap.py
 """
 
+import json
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -216,6 +217,54 @@ def test_redis_swap(sqlite_order_id: str):
         _check("publish_order_event does not raise", False, str(exc))
 
 
+# ─── Test 7: publish_order_paid facade ───────────────────────────────────────
+
+def test_publish_order_paid_facade():
+    """
+    publish_order_paid() must work on ANY backend without hasattr() checks.
+
+    SQLiteBackend → inherits no-op base implementation → no crash.
+    RedisBackend  → overrides with client.publish() → message delivered.
+    """
+    print("\n[7] publish_order_paid facade — no-op on SQLite, live on Redis")
+
+    import eliza_memory as em
+
+    # 7a: SQLite no-op — must not raise
+    sqlite_db = SQLiteBackend()
+    set_backend(sqlite_db)
+    try:
+        em.publish_order_paid("ORDER-NOOP-001", {"amount_usd": 42.00, "test": True})
+        _check("SQLite publish_order_paid is a no-op (no crash)", True)
+    except Exception as exc:
+        _check("SQLite publish_order_paid is a no-op (no crash)", False, str(exc))
+
+    # 7b: RedisBackend — verify publish() is called with correct channel/payload
+    if not _redis_reachable():
+        print(f"  [{SKIP}] Redis publish test — Redis not reachable")
+        _results.append(("Redis publish_order_paid", "SKIP"))
+        return
+
+    import unittest.mock as mock
+    redis_db = RedisBackend(url="redis://localhost:6379/0")
+    set_backend(redis_db)
+
+    with mock.patch.object(redis_db.client, "publish") as mock_pub:
+        em.publish_order_paid("ORDER-PUB-001", {"amount_usd": 99.00})
+        _check("Redis publish_order_paid calls client.publish", mock_pub.called)
+
+        call_args = mock_pub.call_args
+        channel, payload_str = call_args[0]
+        payload = json.loads(payload_str)
+
+        _check("Publish channel is howell:order_events",   channel == "howell:order_events")
+        _check("Publish event_type is 'paid'",             payload["type"] == "paid")
+        _check("Publish order_id correct",                 payload["order_id"] == "ORDER-PUB-001")
+        _check("Publish data.amount_usd correct",          payload["data"]["amount_usd"] == 99.00)
+
+    set_backend(SQLiteBackend())   # restore for subsequent tests
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -226,6 +275,7 @@ def main():
     try:
         sqlite_oid = test_sqlite_write_read()
         test_redis_swap(sqlite_oid)
+        test_publish_order_paid_facade()
     except AssertionError:
         pass  # already printed, continue to summary
 

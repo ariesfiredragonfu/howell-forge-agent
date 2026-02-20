@@ -152,3 +152,21 @@ def count_security_events(
 def get_recent_security_events(since_minutes: int = 60, limit: int = 20) -> list[dict]:
     """Fetch recent security events. Newest first."""
     return get_db().get_recent_security_events(since_minutes, limit)
+
+
+# ─── Pub/Sub ───────────────────────────────────────────────────────────────────
+
+def publish_order_paid(order_id: str, data: dict) -> None:
+    """
+    Fire a real-time "paid" event for the given order.
+
+    When the active backend is RedisBackend this publishes to the
+    "howell:order_events" channel so the Customer Service Agent (or any
+    other subscriber) receives an instant push without polling.
+
+    When the active backend is SQLiteBackend the base-class no-op fires —
+    no crash, no hasattr() check, no branching required at call sites.
+    The PAID state is already persisted in Eliza memory via upsert_order,
+    so the CS agent will see it on its next poll regardless.
+    """
+    get_db().publish_order_event("paid", order_id, data)

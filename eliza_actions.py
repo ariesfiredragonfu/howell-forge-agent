@@ -355,6 +355,10 @@ class VerifyPaymentAction(Action):
                     "action": self.name,
                 },
             )
+            eliza_memory.publish_order_paid(
+                order_id,
+                {"tx_hash": tx_hash, "confirmations": confirmations, "dev_mode": dev_mode},
+            )
             biofeedback.append_reward(
                 agent,
                 f"Order {order_id} verified PAID via Kaito{dev_tag}",
@@ -477,6 +481,10 @@ class RefreshPaymentAction(Action):
                 "ACTION_RESULT",
                 f"CS refresh → Order {order_id} PAID{dev_tag} (tx_hash={tx_hash})",
                 {"order_id": order_id, "status": "PAID", "refreshed": True},
+            )
+            eliza_memory.publish_order_paid(
+                order_id,
+                {"tx_hash": tx_hash, "refreshed": True, "dev_mode": dev_mode},
             )
             biofeedback.append_reward(
                 agent,

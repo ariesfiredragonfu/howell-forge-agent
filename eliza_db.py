@@ -121,6 +121,25 @@ class AbstractDatabaseInterface(ABC):
         """Return all feature records as a list of dicts."""
         ...
 
+    # ── Pub/Sub (optional capability) ─────────────────────────────────────────
+
+    def publish_order_event(
+        self,
+        event_type: str,
+        order_id: str,
+        data: dict,
+    ) -> None:
+        """
+        Publish a real-time order event to any connected subscribers.
+
+        Default is a no-op — SQLiteBackend inherits this and silently does
+        nothing.  RedisBackend overrides it with client.publish().
+
+        Callers (e.g. eliza_memory.publish_order_paid) never need hasattr()
+        checks; they call this method unconditionally and the backend decides
+        whether a real message is sent.
+        """
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     @abstractmethod
