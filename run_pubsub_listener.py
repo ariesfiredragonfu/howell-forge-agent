@@ -44,7 +44,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -129,83 +129,91 @@ def _react_to_paid(order_id: str, data: dict, timestamp: str) -> None:
 
 # ─── Core listener ────────────────────────────────────────────────────────────
 
-async def _listen_once(redis_url: str) -> None:
+async def _listen_once(
+    redis_url: str,
+    on_connected: Optional[Callable[[], None]] = None,
+) -> None:
     """
     Connect, subscribe, and process messages until cancelled or disconnected.
-    Raises redis.exceptions.ConnectionError / asyncio.CancelledError to the
-    caller so the reconnect wrapper can decide what to do.
+
+    on_connected — called once when the "subscribe" confirmation arrives,
+    signalling to _listener_with_reconnect that the session was healthy so
+    it can reset the back-off delay.
+
+    Uses async context managers for both client and pubsub so cleanup
+    (unsubscribe, aclose) is guaranteed regardless of how the coroutine
+    exits — CancelledError, RedisError, or normal return.
     """
     from redis.asyncio import Redis                     # lazy — only when needed
 
-    client: Optional[Redis] = None
-    pubsub = None
     loop = asyncio.get_running_loop()
 
-    try:
-        client = Redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_timeout=_SOCKET_TIMEOUT,
-        )
-        pubsub = client.pubsub()
-        await pubsub.subscribe(_CHANNEL)
-        log.info("Subscribed to %s", _CHANNEL)
+    async with Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_timeout=_SOCKET_TIMEOUT,
+    ) as client:
+        async with client.pubsub() as pubsub:
+            await pubsub.subscribe(_CHANNEL)
 
-        async for message in pubsub.listen():
-            if message["type"] != "message":
-                continue                               # skip subscribe confirmations
+            async for message in pubsub.listen():
+                msg_type = message.get("type")
 
-            try:
-                payload = json.loads(message["data"])
-            except (json.JSONDecodeError, TypeError):
-                log.warning("Malformed message (not JSON): %s", message["data"])
-                continue
+                if msg_type == "subscribe":
+                    # Redis confirms the subscription — connection is live.
+                    # Signal the reconnect wrapper to reset its back-off delay.
+                    log.info("Subscribed to %s (confirmed)", _CHANNEL)
+                    if on_connected:
+                        on_connected()
 
-            event_type = payload.get("type")
-            order_id   = payload.get("order_id", "")
-            data       = payload.get("data", {})
-            timestamp  = payload.get("timestamp", datetime.now(timezone.utc).isoformat())
+                elif msg_type == "message":
+                    try:
+                        payload = json.loads(message["data"])
+                    except (json.JSONDecodeError, TypeError):
+                        log.warning("Malformed message (not JSON): %s", message["data"])
+                        continue
 
-            log.info("Event: type=%s order=%s", event_type, order_id)
+                    event_type = payload.get("type")
+                    order_id   = payload.get("order_id", "")
+                    data       = payload.get("data", {})
+                    timestamp  = payload.get(
+                        "timestamp", datetime.now(timezone.utc).isoformat()
+                    )
 
-            if event_type == "paid" and order_id:
-                # Run sync DB/alert work in a thread so the event loop stays free
-                await loop.run_in_executor(
-                    None, _react_to_paid, order_id, data, timestamp
-                )
-            # Future event types (e.g. "refunded", "failed") go here
+                    log.info("Event: type=%s order=%s", event_type, order_id)
 
-    except asyncio.CancelledError:
-        log.info("Listener cancelled — shutting down cleanly")
-        raise                                          # propagate; do not swallow
-    finally:
-        if pubsub:
-            try:
-                await pubsub.unsubscribe(_CHANNEL)
-                await pubsub.aclose()
-            except Exception:
-                pass
-        if client:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+                    if event_type == "paid" and order_id:
+                        # Sync DB/alert work in a thread — never block the loop
+                        await loop.run_in_executor(
+                            None, _react_to_paid, order_id, data, timestamp
+                        )
+                    # Future event types (e.g. "refunded", "failed") go here
+
+                # all other message types (psubscribe, pong, etc.) are ignored
 
 
 async def _listener_with_reconnect(redis_url: str = REDIS_URL) -> None:
     """
     Wraps _listen_once with exponential back-off reconnect.
 
-    Exits only when cancelled.  Every other exception (connection refused,
-    timeout, protocol error) triggers a logged wait then a fresh attempt.
+    Back-off resets to base when the session was confirmed live before
+    dropping (i.e. we saw a "subscribe" ack from Redis).  Without this,
+    a brief network blip would leave the listener waiting 64 seconds even
+    after Redis comes back — penalising a healthy recovery.
+
+    Exits only when cancelled.
     """
     delay = _RECONNECT_BASE
 
     while True:
+        connected = False
+
+        def _mark_connected() -> None:
+            nonlocal connected
+            connected = True
+
         try:
-            await _listen_once(redis_url)
-            # _listen_once returns normally only if the message loop exits
-            # without error (e.g. server closed the connection gracefully).
+            await _listen_once(redis_url, on_connected=_mark_connected)
             log.warning("Pub/sub loop exited — reconnecting in %ds", delay)
 
         except asyncio.CancelledError:
@@ -215,8 +223,14 @@ async def _listener_with_reconnect(redis_url: str = REDIS_URL) -> None:
             log.error("Pub/sub error (%s: %s) — reconnecting in %ds",
                       type(exc).__name__, exc, delay)
 
+        # Reset delay if this session was healthy before it dropped.
+        # Keep incrementing if we failed before even subscribing (e.g. ECONNREFUSED).
+        if connected:
+            delay = _RECONNECT_BASE
+        else:
+            delay = min(delay * 2, _RECONNECT_CAP)
+
         await asyncio.sleep(delay)
-        delay = min(delay * 2, _RECONNECT_CAP)        # exponential back-off, capped
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
