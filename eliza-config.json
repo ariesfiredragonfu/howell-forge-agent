@@ -1,50 +1,56 @@
 {
   "project": "howell-forge-order-loop",
   "version": "2.0.0",
-  "description": "ElizaOS Order Loop — Howell Forge Shop + Customer Service agents",
-
+  "description": "ElizaOS Order Loop \u2014 Howell Forge Shop + Customer Service agents",
   "runtime": {
     "python": "3.12",
     "agent_dir": "~/howell-forge-agent",
     "log_dir": "~/project_docs",
     "db_path": "~/.config/howell-forge-eliza.db"
   },
-
   "memory": {
     "adapter": "sqlite",
     "db_path": "~/.config/howell-forge-eliza.db",
     "tables": {
       "memories": "memories",
-      "orders":   "orders",
+      "orders": "orders",
       "security_events": "security_events"
     },
     "module": "eliza_memory"
   },
-
   "providers": [
     {
       "name": "ORDER_STATE",
       "module": "eliza_providers",
       "class": "OrderStateProvider",
-      "description": "Real-time order state — shared by Shop Agent and Customer Service Agent",
-      "consumers": ["SHOP_AGENT", "CUSTOMER_SERVICE_AGENT"]
+      "description": "Real-time order state \u2014 shared by Shop Agent and Customer Service Agent",
+      "consumers": [
+        "SHOP_AGENT",
+        "CUSTOMER_SERVICE_AGENT"
+      ]
     },
     {
       "name": "SECURITY_CONTEXT",
       "module": "eliza_providers",
       "class": "SecurityContextProvider",
-      "description": "Recent security events — consumed by Monitor Agent",
-      "consumers": ["MONITOR_AGENT", "CUSTOMER_SERVICE_AGENT"]
+      "description": "Recent security events \u2014 consumed by Monitor Agent",
+      "consumers": [
+        "MONITOR_AGENT",
+        "CUSTOMER_SERVICE_AGENT"
+      ]
     },
     {
       "name": "FEATURE_STATUS",
       "module": "eliza_providers",
       "class": "FeatureStatusProvider",
       "description": "Read-only feature gate status (DEV/BETA/LIVE/DEPRECATED) from feature_states table",
-      "consumers": ["HERALD_AGENT", "SHOP_AGENT", "CUSTOMER_SERVICE_AGENT"]
+      "consumers": [
+        "HERALD_AGENT",
+        "SHOP_AGENT",
+        "CUSTOMER_SERVICE_AGENT"
+      ]
     }
   ],
-
   "actions": [
     {
       "name": "VERIFY_PAYMENT",
@@ -75,15 +81,14 @@
       "name": "VALIDATE_FEATURE",
       "module": "eliza_actions",
       "class": "ValidateFeatureAction",
-      "description": "Gate Herald posts on feature status (LIVE only) + entity whitelist match ≥80%.",
+      "description": "Gate Herald posts on feature status (LIVE only) + entity whitelist match \u226580%.",
       "triggered_by": "HERALD_AGENT",
       "raises": "ValidationError",
       "logs_to": "fortress_errors.log"
     }
   ],
-
   "herald": {
-    "description": "Social post agent — gates all posts through VALIDATE_FEATURE before generation",
+    "description": "Social post agent \u2014 gates all posts through VALIDATE_FEATURE before generation",
     "feature_gate": "Herald (Social Post)",
     "budget": {
       "normal_posts_per_day": null,
@@ -100,20 +105,46 @@
       "made in USA"
     ]
   },
-
   "feature_states": {
     "table": "feature_states",
     "seed": [
-      {"feature_name": "Kaito Payments",       "status": "DEV",  "description": "Polygon stablecoin payment processing"},
-      {"feature_name": "Order Loop",            "status": "BETA", "description": "Async priority queue for concurrent order processing"},
-      {"feature_name": "Security Handshake",    "status": "LIVE", "description": "fortress_watcher → security_agent → GitHub PR pipeline"},
-      {"feature_name": "Biofeedback Scaling",   "status": "LIVE", "description": "EWMA reward/constraint score driving deployment cadence"},
-      {"feature_name": "Customer Service Bot",  "status": "BETA", "description": "ElizaOS-native CS agent with PAID gate"},
-      {"feature_name": "Herald (Social Post)",  "status": "DEV",  "description": "X/social post generation with entity whitelist"},
-      {"feature_name": "Shop Manager",          "status": "DEV",  "description": "Order-to-production-to-ship workflow"}
+      {
+        "feature_name": "Kaito Payments",
+        "status": "DEV",
+        "description": "Polygon stablecoin payment processing"
+      },
+      {
+        "feature_name": "Order Loop",
+        "status": "BETA",
+        "description": "Async priority queue for concurrent order processing"
+      },
+      {
+        "feature_name": "Security Handshake",
+        "status": "LIVE",
+        "description": "fortress_watcher \u2192 security_agent \u2192 GitHub PR pipeline"
+      },
+      {
+        "feature_name": "Biofeedback Scaling",
+        "status": "LIVE",
+        "description": "EWMA reward/constraint score driving deployment cadence"
+      },
+      {
+        "feature_name": "Customer Service Bot",
+        "status": "BETA",
+        "description": "ElizaOS-native CS agent with PAID gate"
+      },
+      {
+        "feature_name": "Herald (Social Post)",
+        "status": "DEV",
+        "description": "X/social post generation with entity whitelist"
+      },
+      {
+        "feature_name": "Shop Manager",
+        "status": "DEV",
+        "description": "Order-to-production-to-ship workflow"
+      }
     ]
   },
-
   "agents": {
     "shop_agent": {
       "module": "shop_agent",
@@ -127,16 +158,26 @@
         "payment_poll_interval_sec": 10,
         "payment_timeout_sec": 3600
       },
-      "uses_providers": ["ORDER_STATE"],
-      "uses_actions": ["VERIFY_PAYMENT", "IMPORT_ORDER"],
+      "uses_providers": [
+        "ORDER_STATE"
+      ],
+      "uses_actions": [
+        "VERIFY_PAYMENT",
+        "IMPORT_ORDER"
+      ],
       "writes_memory": true,
       "reads_memory": true
     },
     "customer_service_agent": {
       "module": "customer_service_agent",
       "entry": "where_is_my_order",
-      "uses_providers": ["ORDER_STATE", "SECURITY_CONTEXT"],
-      "uses_actions": ["REFRESH_PAYMENT"],
+      "uses_providers": [
+        "ORDER_STATE",
+        "SECURITY_CONTEXT"
+      ],
+      "uses_actions": [
+        "REFRESH_PAYMENT"
+      ],
       "writes_memory": false,
       "reads_memory": true,
       "delivery_gate": "PAID"
@@ -144,37 +185,69 @@
     "monitor_agent": {
       "module": "monitor",
       "entry": "main",
-      "uses_providers": ["SECURITY_CONTEXT"],
+      "uses_providers": [
+        "SECURITY_CONTEXT"
+      ],
       "reads_fortress_log": "~/project_docs/fortress_errors.log",
       "self_healing_threshold": 3,
       "self_healing_window_min": 30
     }
   },
-
   "kaito": {
     "config_file": "~/.config/cursor-kaito-config",
     "module": "kaito_engine",
     "dev_mode": true,
-    "networks_supported": ["polygon", "ethereum", "solana"],
+    "networks_supported": [
+      "polygon",
+      "ethereum",
+      "solana"
+    ],
     "default_network": "polygon",
-    "payment_status_values": ["Confirmed", "Pending", "Failed", "Expired"]
+    "payment_status_values": [
+      "Confirmed",
+      "Pending",
+      "Failed",
+      "Expired"
+    ]
   },
-
   "order_status_machine": {
-    "states": ["Pending", "Processing", "PAID", "Success", "Failed", "Expired"],
+    "states": [
+      "Pending",
+      "Processing",
+      "PAID",
+      "Success",
+      "Failed",
+      "Expired"
+    ],
     "initial": "Pending",
-    "terminal": ["PAID", "Success", "Failed", "Expired"],
-    "delivery_unlocked_by": ["PAID", "Success"],
+    "terminal": [
+      "PAID",
+      "Success",
+      "Failed",
+      "Expired"
+    ],
+    "delivery_unlocked_by": [
+      "PAID",
+      "Success"
+    ],
     "transitions": {
-      "Pending":    ["PAID", "Failed", "Expired", "Pending"],
-      "Processing": ["PAID", "Failed", "Expired"],
-      "PAID":       [],
-      "Success":    [],
-      "Failed":     [],
-      "Expired":    []
+      "Pending": [
+        "PAID",
+        "Failed",
+        "Expired",
+        "Pending"
+      ],
+      "Processing": [
+        "PAID",
+        "Failed",
+        "Expired"
+      ],
+      "PAID": [],
+      "Success": [],
+      "Failed": [],
+      "Expired": []
     }
   },
-
   "security": {
     "fortress_log": "~/project_docs/fortress_errors.log",
     "security_hooks_module": "security_hooks",
@@ -184,18 +257,26 @@
     "failed_tx_window_min": 60,
     "self_healing_action": "rotate_credentials_alert"
   },
-
   "notifications": {
     "module": "notifications",
     "provider": "telegram_via_zapier",
     "config_file": "~/.config/cursor-zapier-telegram-webhook"
   },
-
   "orchestrator": {
     "module": "run_order_loop",
     "daemon_entry": "daemon_loop",
     "sync_interval_sec": 60,
     "stripe_sync_limit": 20,
     "run_agents_module": "run_agents"
+  },
+  "biofeedback": {
+    "use_ewma": true,
+    "half_life_days": 7.0,
+    "score_floor": -10.0,
+    "thresholds": {
+      "high": 3.0,
+      "throttle": -2.0
+    },
+    "_comment": "Set use_ewma: false to fall back to simple event-count scoring (rewards - constraints)"
   }
 }

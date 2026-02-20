@@ -49,6 +49,24 @@ EWMA_STATE_PATH  = BIOFEEDBACK_DIR / "ewma_state.json"
 
 INSERT_MARKER = "---\n\n"
 
+_CONFIG_PATH = Path(__file__).parent / "eliza-config.json"
+
+# ─── Config reader ────────────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    """Read the biofeedback block from eliza-config.json.  Thread-safe: each
+    call re-reads the file so a live config change takes effect on the next event."""
+    try:
+        raw = json.loads(_CONFIG_PATH.read_text())
+        return raw.get("biofeedback", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _use_ewma() -> bool:
+    return _load_config().get("use_ewma", True)
+
+
 # ─── EWMA constants ───────────────────────────────────────────────────────────
 
 HALF_LIFE_DAYS = 7
@@ -82,7 +100,13 @@ def _load_ewma() -> dict:
             return json.loads(EWMA_STATE_PATH.read_text())
         except (json.JSONDecodeError, OSError):
             pass
-    return {"score": 0.0, "last_event_ts": None, "event_count": 0}
+    return {
+        "score": 0.0,
+        "last_event_ts": None,
+        "event_count": 0,
+        "positive_count": 0,   # for legacy fallback
+        "negative_count": 0,   # for legacy fallback
+    }
 
 
 def _save_ewma(state: dict) -> None:
@@ -100,44 +124,138 @@ def _decay(score: float, last_ts: Optional[float], now_ts: float) -> float:
     return score * math.exp(-DECAY_LAMBDA * elapsed)
 
 
-def record_event(event_type: str, agent: str = "UNKNOWN") -> float:
-    """
-    Record a biofeedback event and return the new EWMA score.
+# ─── Legacy (count-based) fallback ───────────────────────────────────────────
 
-    This is the primary write path for the score engine.
-    append_reward() and append_constraint() call this internally.
+def _legacy_score(state: dict) -> float:
+    """
+    Simple event-count score used when use_ewma=false.
+
+    score = (positive_count - negative_count) normalised to [-10, +10].
+    Capped at ±10 so extreme histories don't lock the scaler.
+    No decay — every event counts equally regardless of age.
+    """
+    pos = state.get("positive_count", 0)
+    neg = state.get("negative_count", 0)
+    raw = float(pos - neg)
+    return max(SCORE_FLOOR, min(10.0, raw))
+
+
+# ─── EWMA core ────────────────────────────────────────────────────────────────
+
+def _audit_remember(
+    agent: str,
+    event_type: str,
+    pre_decay_score: float,
+    decayed_score: float,
+    weight: float,
+    new_score: float,
+    elapsed_sec: float,
+) -> None:
+    """
+    Write an audit memory entry to Eliza memory.
+
+    Best-effort — DB unavailability must never break the scoring path.
+    Lazy import avoids the circular-import risk (biofeedback ← eliza_memory
+    ← eliza_db; none of those import biofeedback).
+    """
+    try:
+        import eliza_memory  # noqa: PLC0415  (lazy intentionally)
+        elapsed_days = elapsed_sec / 86400
+        decay_delta  = decayed_score - pre_decay_score
+        rationale = (
+            f"EWMA decay applied: {decay_delta:+.4f} "
+            f"from {elapsed_days:.2f}-day-old score "
+            f"(λ·t={DECAY_LAMBDA * elapsed_sec:.4f}); "
+            f"event={event_type} weight={weight:+.1f}; "
+            f"score {pre_decay_score:.4f} → {decayed_score:.4f} → {new_score:.4f}"
+        )
+        eliza_memory.remember(
+            agent   = agent,
+            type_   = "BIOFEEDBACK_EWMA",
+            content = rationale,
+            metadata= {
+                "event_type":    event_type,
+                "weight":        weight,
+                "pre_decay":     round(pre_decay_score, 6),
+                "post_decay":    round(decayed_score,   6),
+                "new_score":     round(new_score,       6),
+                "elapsed_days":  round(elapsed_days,    4),
+                "half_life_days": HALF_LIFE_DAYS,
+            },
+        )
+    except Exception:
+        pass  # audit is best-effort; never crash the scoring path
+
+
+def record_event(
+    event_type: str,
+    agent: str = "UNKNOWN",
+    _now_ts: Optional[float] = None,   # injectable for tests; None → time.time()
+) -> float:
+    """
+    Record a biofeedback event and return the new score.
+
+    Primary write path — append_reward() and append_constraint() call this.
+
+    When use_ewma=true (default):
+      1. Decay the stored score for time elapsed since the last event.
+      2. Add the event weight.
+      3. Clamp to [SCORE_FLOOR, +∞].
+      4. Write an audit entry to Eliza memory.
+
+    When use_ewma=false:
+      Increment positive_count or negative_count and return _legacy_score().
 
     Args:
-        event_type: Key from EVENT_WEIGHTS (unknown types score 0).
-        agent:      Agent name for logging.
-
-    Returns:
-        The new EWMA score after applying decay and the event weight.
+        event_type: Key from EVENT_WEIGHTS (unknown types score 0 and skip audit).
+        agent:      Agent name for logging and memory entry.
+        _now_ts:    Unix timestamp override (for deterministic tests).
     """
     _ensure_dir()
     weight = EVENT_WEIGHTS.get(event_type, 0.0)
     if weight == 0.0:
         return get_score()
 
-    now_ts = time.time()
+    now_ts = _now_ts if _now_ts is not None else time.time()
     state  = _load_ewma()
 
-    decayed   = _decay(state["score"], state.get("last_event_ts"), now_ts)
-    new_score = max(SCORE_FLOOR, decayed + weight)
+    # ── Track raw counts for legacy fallback regardless of mode ───────────────
+    if weight > 0:
+        state["positive_count"] = state.get("positive_count", 0) + 1
+    else:
+        state["negative_count"] = state.get("negative_count", 0) + 1
+
+    state["event_count"] = state.get("event_count", 0) + 1
+
+    if not _use_ewma():
+        _save_ewma(state)
+        return _legacy_score(state)
+
+    # ── EWMA path ─────────────────────────────────────────────────────────────
+    pre_decay_score = state["score"]
+    elapsed_sec     = max(0.0, now_ts - state["last_event_ts"]) \
+                      if state.get("last_event_ts") is not None else 0.0
+    decayed         = _decay(pre_decay_score, state.get("last_event_ts"), now_ts)
+    new_score       = max(SCORE_FLOOR, decayed + weight)
 
     state["score"]         = new_score
     state["last_event_ts"] = now_ts
-    state["event_count"]   = state.get("event_count", 0) + 1
     _save_ewma(state)
+
+    _audit_remember(agent, event_type, pre_decay_score, decayed, weight, new_score, elapsed_sec)
     return new_score
 
 
 def get_score() -> float:
     """
-    Current EWMA score with decay applied up to now (no new event recorded).
+    Current score with decay applied up to now (no new event recorded).
+
+    When use_ewma=false returns _legacy_score() from stored counts.
     Returns 0.0 if no events have ever been recorded.
     """
     state = _load_ewma()
+    if not _use_ewma():
+        return _legacy_score(state)
     if state.get("last_event_ts") is None:
         return state.get("score", 0.0)
     decayed = _decay(state["score"], state["last_event_ts"], time.time())
