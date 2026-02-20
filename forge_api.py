@@ -148,6 +148,32 @@ def list_orders():
     return {"total": len(orders), "orders": orders}
 
 
+@app.get("/orders/{order_id}/hash")
+def get_order_hash(order_id: str):
+    """Return SHA-256 hashes + chain receipt for an order's forge outputs."""
+    from forge_hash import hash_forge_outputs, push_hash_to_chain
+    order_dir = FORGE_ORDERS_DIR / order_id
+
+    # Return stored hashes.json if it exists (fast path)
+    hashes_file = order_dir / "hashes.json"
+    if hashes_file.exists():
+        return json.loads(hashes_file.read_text())
+
+    # Otherwise compute on-the-fly from existing files
+    step  = order_dir / "part.step"
+    gcode = order_dir / "part.gcode"
+    stl   = order_dir / "part.stl"
+    if not any(p.exists() for p in [step, gcode, stl]):
+        raise HTTPException(404, f"No forge outputs found for {order_id}")
+
+    hashes = hash_forge_outputs(
+        step_path  = step  if step.exists()  else None,
+        gcode_path = gcode if gcode.exists() else None,
+        stl_path   = stl   if stl.exists()   else None,
+    )
+    return hashes
+
+
 @app.get("/forge-file/{order_id}/{filename}")
 def serve_forge_file(order_id: str, filename: str):
     """Serve STL, STEP, G-code, or PNG renders for an order."""

@@ -77,11 +77,19 @@ def _forge_run_info(order_id: str) -> dict:
     if not order_dir.exists():
         return {"run_exists": False}
 
+    forge_log: dict = {}
     log_path = order_dir / "forge_log.json"
-    forge_log = {}
     if log_path.exists():
         try:
             forge_log = json.loads(log_path.read_text())
+        except Exception:
+            pass
+
+    hashes: dict = {}
+    hashes_path = order_dir / "hashes.json"
+    if hashes_path.exists():
+        try:
+            hashes = json.loads(hashes_path.read_text())
         except Exception:
             pass
 
@@ -100,6 +108,14 @@ def _forge_run_info(order_id: str) -> dict:
         "approved":        forge_log.get("approved"),
         "completed_at":    forge_log.get("completed_at"),
         "description":     forge_log.get("description"),
+        "hashes": {
+            "step_sha256":      hashes.get("step_sha256"),
+            "gcode_sha256":     hashes.get("gcode_sha256"),
+            "stl_sha256":       hashes.get("stl_sha256"),
+            "manifest_sha256":  hashes.get("manifest_sha256"),
+            "on_chain":         hashes.get("on_chain", False),
+            "chain_tx":         hashes.get("chain", {}).get("tx_hash"),
+        },
     }
 
 

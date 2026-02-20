@@ -831,7 +831,19 @@ def forge_manager_v1(order_id: str, description: str) -> dict:
     validation  = _validate_gcode(gcode_path)
     freecad_paths["gcode"] = gcode_path
 
-    # ── 4b. Render toolpath visualisation ────────────────────────────────────
+    # ── 4b. SHA-256 hash STEP + G-code + STL → on-chain anchor ───────────────
+    from forge_hash import hash_forge_outputs, push_hash_to_chain
+    hashes       = hash_forge_outputs(
+        step_path  = freecad_paths.get("step"),
+        gcode_path = gcode_path,
+        stl_path   = freecad_paths.get("stl"),
+    )
+    chain_receipt = push_hash_to_chain(hashes, order_id)
+    freecad_paths["hashes"]       = hashes
+    freecad_paths["chain_receipt"] = chain_receipt
+    (output_dir / "hashes.json").write_text(json.dumps({**hashes, "chain": chain_receipt}, indent=2))
+
+    # ── 4c. Render toolpath visualisation ────────────────────────────────────
     _render_toolpath(gcode_path, output_dir, freecad_paths.get("bbox_mm", []))
 
     # ── 5. Human review ───────────────────────────────────────────────────────
@@ -865,9 +877,13 @@ def forge_manager_v1(order_id: str, description: str) -> dict:
             "stl":   str(freecad_paths.get("stl",   "")),
             "gcode": str(freecad_paths.get("gcode", "")),
         },
-        "bbox_mm":     freecad_paths.get("bbox_mm"),
-        "validation":  validation,
-        "timestamp":   datetime.now(timezone.utc).isoformat(),
+        "bbox_mm":          freecad_paths.get("bbox_mm"),
+        "gcode_validation": validation,
+        "hashes":           freecad_paths.get("hashes", {}),
+        "chain_receipt":    freecad_paths.get("chain_receipt", {}),
+        "approved":         result.get("approved", False),
+        "completed_at":     datetime.now(timezone.utc).isoformat(),
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
     }
     (output_dir / "forge_log.json").write_text(json.dumps(log, indent=2))
     print(f"[FORGE] Run log → {output_dir}/forge_log.json")

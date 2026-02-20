@@ -66,13 +66,56 @@ export default function OrderQueue({ ctx, onSelectOrder }) {
               </div>
 
               {run.run_exists && (
-                <div style={{ fontSize: '0.65rem', color: '#4a4a6a', marginTop: 3 }}>
-                  {run.description && <span>{run.description.slice(0, 50)} · </span>}
-                  {run.bbox_mm && <span>bbox {run.bbox_mm[0]?.toFixed(0)}×{run.bbox_mm[1]?.toFixed(0)} mm · </span>}
-                  {run.render_count > 0 && <span>{run.render_count} renders · </span>}
-                  <span style={{ color: run.gcode_valid ? '#22c55e' : '#ef4444' }}>
-                    gcode {run.gcode_valid ? '✓' : '✗'}
-                  </span>
+                <div style={{ marginTop: 3 }}>
+                  <div style={{ fontSize: '0.65rem', color: '#4a4a6a' }}>
+                    {run.description && <span>{run.description.slice(0, 48)} · </span>}
+                    {run.bbox_mm && <span>{run.bbox_mm[0]?.toFixed(0)}×{run.bbox_mm[1]?.toFixed(0)} mm · </span>}
+                    {run.render_count > 0 && <span>{run.render_count} renders · </span>}
+                    <span style={{ color: run.gcode_valid ? '#22c55e' : '#ef4444' }}>
+                      gcode {run.gcode_valid ? '✓' : '✗'}
+                    </span>
+                  </div>
+
+                  {/* SHA-256 hash display */}
+                  {run.hashes?.manifest_sha256 && (
+                    <div style={{
+                      marginTop: 4,
+                      padding: '3px 6px',
+                      background: '#0a0a18',
+                      border: '1px solid #1a1a2e',
+                      borderRadius: 3,
+                      fontFamily: 'monospace',
+                    }}>
+                      <div style={{ fontSize: '0.55rem', color: '#3a3a5a', letterSpacing: '0.1em', marginBottom: 2 }}>
+                        SHA-256 MANIFEST
+                      </div>
+                      <div style={{ fontSize: '0.6rem', color: '#5555aa', letterSpacing: '0.05em' }}
+                           title={run.hashes.manifest_sha256}>
+                        {run.hashes.manifest_sha256.slice(0, 12)}…{run.hashes.manifest_sha256.slice(-8)}
+                      </div>
+                      <div style={{ display: 'flex', gap: 8, marginTop: 3 }}>
+                        {['step', 'gcode', 'stl'].map(k => {
+                          const h = run.hashes[`${k}_sha256`]
+                          return h ? (
+                            <span key={k} style={{ fontSize: '0.55rem', color: '#3a3a5a' }}
+                                  title={h}>
+                              {k}: {h.slice(0,6)}…
+                            </span>
+                          ) : null
+                        })}
+                      </div>
+                      <div style={{ marginTop: 3, fontSize: '0.55rem' }}>
+                        <span style={{
+                          color: run.hashes.on_chain ? '#22c55e' : '#3a3a5a',
+                          letterSpacing: '0.1em',
+                        }}>
+                          {run.hashes.on_chain
+                            ? `⛓ ON-CHAIN ${run.hashes.chain_tx?.slice(0,10)}…`
+                            : '⛓ LOCAL — awaiting Kaito LIVE'}
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
