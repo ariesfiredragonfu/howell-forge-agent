@@ -419,7 +419,167 @@ def _validate_gcode(gcode_path: Path) -> dict:
     return {"ok": ok, "issues": issues, "raw": output}
 
 
-# ─── Step 4b: Blender headless preview render ────────────────────────────────
+# ─── Step 4b: G-code toolpath visualiser ────────────────────────────────────
+
+def _render_toolpath(gcode_path: Path, output_dir: Path, bbox_mm: list) -> Path | None:
+    """
+    Parse G-code and render a 2D toolpath plot as a PNG.
+
+    Color coding:
+      Blue solid   — G1 cutting moves (XY)
+      Red dashed   — G0 rapid moves (XY)
+      Orange dot   — plunge / retract (Z change while XY fixed)
+      Green circle — start point
+      Red X        — end point
+
+    Returns the PNG path, or None if matplotlib unavailable.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from matplotlib.patches import FancyArrowPatch
+    except ImportError:
+        print("[FORGE] matplotlib not available — skipping toolpath render")
+        return None
+
+    # ── Parse G-code moves ────────────────────────────────────────────────────
+    x, y, z   = 0.0, 0.0, 0.0
+    mode      = "G0"    # current motion mode
+    rapids:  list[tuple] = []   # (x0,y0,x1,y1)
+    cuts:    list[tuple] = []
+    plunges: list[tuple] = []   # (x, y) where Z changes
+
+    for raw_line in gcode_path.read_text().splitlines():
+        line = raw_line.split(";")[0].strip().upper()
+        if not line:
+            continue
+
+        if line.startswith("G0 ") or line == "G0":
+            mode = "G0"
+        elif line.startswith("G1 ") or line == "G1":
+            mode = "G1"
+
+        nx, ny, nz = x, y, z
+        for token in line.split():
+            try:
+                if token.startswith("X"):
+                    nx = float(token[1:])
+                elif token.startswith("Y"):
+                    ny = float(token[1:])
+                elif token.startswith("Z"):
+                    nz = float(token[1:])
+            except ValueError:
+                pass
+
+        moved_xy = (nx != x or ny != y)
+        moved_z  = (nz != z)
+
+        if moved_z and not moved_xy:
+            plunges.append((x, y))
+
+        if moved_xy:
+            seg = (x, y, nx, ny)
+            if mode == "G0":
+                rapids.append(seg)
+            else:
+                cuts.append(seg)
+
+        x, y, z = nx, ny, nz
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.set_facecolor("#1a1a2e")
+    fig.patch.set_facecolor("#12121f")
+
+    bx, by = (bbox_mm[0], bbox_mm[1]) if bbox_mm else (0, 0)
+
+    # Part outline (stock boundary)
+    if bx > 0 and by > 0:
+        rect = plt.Rectangle((0, 0), bx, by,
+                              linewidth=1.5, edgecolor="#555577",
+                              facecolor="#2a2a3e", zorder=1, label="Stock boundary")
+        ax.add_patch(rect)
+
+    def draw_arrow_segments(segs, color, lw, ls, zorder, label):
+        for i, (x0, y0, x1, y1) in enumerate(segs):
+            ax.annotate(
+                "", xy=(x1, y1), xytext=(x0, y0),
+                arrowprops=dict(
+                    arrowstyle="->" if ls == "solid" else "->",
+                    color=color, lw=lw,
+                    linestyle=ls,
+                    connectionstyle="arc3,rad=0",
+                ),
+                zorder=zorder,
+            )
+        if segs:
+            ax.plot([], [], color=color, lw=lw, ls="--" if ls == "dashed" else "-",
+                    label=label)
+
+    # Rapid moves
+    for x0, y0, x1, y1 in rapids:
+        ax.plot([x0, x1], [y0, y1], color="#ff4444", lw=1.2,
+                ls="--", zorder=2, alpha=0.7)
+    if rapids:
+        ax.plot([], [], color="#ff4444", lw=1.2, ls="--", label="Rapid (G0)")
+
+    # Cutting moves with arrows every segment
+    for i, (x0, y0, x1, y1) in enumerate(cuts):
+        ax.annotate(
+            "", xy=(x1, y1), xytext=(x0, y0),
+            arrowprops=dict(arrowstyle="->", color="#44aaff",
+                            lw=2.0, connectionstyle="arc3,rad=0"),
+            zorder=3,
+        )
+    if cuts:
+        ax.plot([], [], color="#44aaff", lw=2.0, label="Cut (G1)")
+
+    # Plunge points
+    for px, py in plunges:
+        ax.plot(px, py, "o", color="#ffaa00", ms=8, zorder=4)
+    if plunges:
+        ax.plot([], [], "o", color="#ffaa00", ms=8, label="Plunge / retract")
+
+    # Start and end markers
+    if cuts or rapids:
+        all_moves = rapids + cuts
+        sx, sy = all_moves[0][0], all_moves[0][1]
+        ex, ey = all_moves[-1][2], all_moves[-1][3]
+        ax.plot(sx, sy, "o", color="#00ff88", ms=12, zorder=5, label="Start")
+        ax.plot(ex, ey, "X", color="#ff4444", ms=12, zorder=5,
+                markeredgewidth=2, label="End")
+
+    # Axes and labels
+    pad = max(bx, by) * 0.12 if (bx or by) else 10
+    ax.set_xlim(-pad, bx + pad)
+    ax.set_ylim(-pad, by + pad)
+    ax.set_aspect("equal")
+    ax.set_xlabel("X (mm)", color="#aaaacc")
+    ax.set_ylabel("Y (mm)", color="#aaaacc")
+    ax.tick_params(colors="#888899")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#444466")
+    ax.grid(True, color="#333355", lw=0.5)
+
+    title = f"Toolpath — {gcode_path.parent.name}"
+    if bx and by:
+        title += f"\nStock: {bx:.1f} × {by:.1f} mm"
+    ax.set_title(title, color="#ccccee", fontsize=12, pad=10)
+
+    legend = ax.legend(facecolor="#1a1a2e", edgecolor="#555577",
+                       labelcolor="#ccccee", fontsize=9)
+
+    out_path = output_dir / "preview_toolpath.png"
+    fig.savefig(out_path, dpi=120, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"[FORGE] ✓ Toolpath render → {out_path}")
+    return out_path
+
+
+# ─── Step 4c: Blender headless preview render ────────────────────────────────
 
 _BLENDER_RENDER_SCRIPT = """\
 import bpy, math, sys
@@ -670,6 +830,9 @@ def forge_manager_v1(order_id: str, description: str) -> dict:
     gcode_path  = _generate_stub_gcode(order_id, description, freecad_paths, output_dir)
     validation  = _validate_gcode(gcode_path)
     freecad_paths["gcode"] = gcode_path
+
+    # ── 4b. Render toolpath visualisation ────────────────────────────────────
+    _render_toolpath(gcode_path, output_dir, freecad_paths.get("bbox_mm", []))
 
     # ── 5. Human review ───────────────────────────────────────────────────────
     approved = _human_review(freecad_paths["stl"], gcode_path, validation)
