@@ -4,12 +4,18 @@ Forge Manager V1 — Linear happy-path: PAID order → In Production.
 
 Flow:
   1. Verify order is PAID (reads from Eliza DB)
-  2. Generate FreeCAD Python script via xAI Grok (turns description → CAD code)
+  2. Generate FreeCAD Python script via Claude Code CLI (turns description → CAD code)
+     Falls back to smart local parametric generator if Claude CLI is unavailable.
   3. Run FreeCAD headlessly → exports STEP + STL
   4. Generate stub G-code (bounding-box contour) → validate with gcode_validator
   5. PAUSE for human visual check (open STL in FreeCAD, review G-code)
   6. On approval  → biofeedback reward, order → "In Production", Telegram + CS notify
      On rejection → biofeedback constraint, order stays, Telegram alert
+
+Script generation uses Claude Code CLI (`claude -p`):
+  - Zero API cost — uses your existing Cursor/Claude Code subscription
+  - One-time setup: run `claude login` from the terminal to authenticate
+  - Falls back to local parametric generator automatically if not logged in
 
 No retries, no error branches — V1 happy path only.
 Safety branches come in V2.
@@ -37,7 +43,7 @@ from notifications import send_telegram_alert
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-XAI_API_KEY_PATH  = Path.home() / ".config" / "howell-forge" / "xai-api-key"
+CLAUDE_CLI        = Path.home() / ".local" / "bin" / "claude"   # installed by Claude Code
 OUTPUT_BASE       = Path.home() / "Hardware_Factory" / "forge_orders"
 FREECADCMD        = "freecadcmd"
 AGENT_NAME        = "FORGE_MANAGER"
@@ -47,38 +53,32 @@ GCODE_VALIDATOR   = Path(__file__).parent / "gcode_validator.py"
 X_MAX_MM, Y_MAX_MM, Z_MAX_MM = 300.0, 300.0, 100.0
 
 
-# ─── xAI Grok helper ─────────────────────────────────────────────────────────
+# ─── Claude Code CLI helper ───────────────────────────────────────────────────
 
-def _xai_key() -> str:
-    """Read xAI API key from file or env."""
-    env_key = os.environ.get("XAI_API_KEY", "").strip()
-    if env_key:
-        return env_key
-    if XAI_API_KEY_PATH.exists():
-        return XAI_API_KEY_PATH.read_text().strip()
-    raise RuntimeError(f"xAI API key not found. Set XAI_API_KEY env or create {XAI_API_KEY_PATH}")
+def _call_claude_cli(prompt: str, timeout: int = 90) -> str:
+    """
+    Invoke Claude Code CLI in non-interactive print mode.
 
+    Uses the locally installed `claude` binary (Claude Code v2+).
+    Requires a one-time `claude login` from the terminal.
 
-def _call_grok(prompt: str, model: str = "grok-2-latest") -> str:
-    """Call xAI Grok via OpenAI-compatible endpoint. Returns content string."""
-    import urllib.request, urllib.error
-    payload = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.x.ai/v1/chat/completions",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {_xai_key()}",
-        },
-        method="POST",
+    Raises RuntimeError on failure (not logged in, timeout, etc.)
+    so the caller can fall back to the local generator.
+    """
+    cli = str(CLAUDE_CLI) if CLAUDE_CLI.exists() else "claude"
+    result = subprocess.run(
+        [cli, "-p", prompt, "--output-format", "text"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-    return data["choices"][0]["message"]["content"]
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise RuntimeError(f"claude CLI exited {result.returncode}: {stderr[:300]}")
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError("claude CLI returned empty output")
+    return output
 
 
 # ─── Step 1: Verify PAID ──────────────────────────────────────────────────────
@@ -100,108 +100,188 @@ def _verify_paid_order(order_id: str) -> dict:
     return order
 
 
-# ─── Step 2: Generate FreeCAD script via xAI Grok ────────────────────────────
+# ─── Step 2: Generate FreeCAD script via Claude Code CLI ─────────────────────
 
-_FREECAD_SYSTEM_PROMPT = """\
-You are a FreeCAD 0.21.2 expert writing headless Python scripts for a CNC shop.
-Rules:
-- Use only: FreeCAD, Part, MeshPart modules (no GUI, no App.Gui, no Mesh.createFrom)
-- To export STL use: import MeshPart; mesh = MeshPart.meshFromShape(Shape=shape, LinearDeflection=0.1, AngularDeflection=0.08, Relative=False); mesh.write(OUTPUT_STL)
-- Create ONE document, build the part, export STEP to OUTPUT_STEP and STL to OUTPUT_STL
-- OUTPUT_STEP and OUTPUT_STL are Python variables already defined before your code runs
-- Use inch units (25.4 mm per inch) for all dimensions
-- Add a print() at the end with the bounding box in mm: print("BBOX:", bbox.XLength, bbox.YLength, bbox.ZLength)
-- Keep it under 80 lines
-- No try/except — V1 happy path only
+_CLAUDE_FREECAD_PROMPT = """\
+You are a FreeCAD 0.21.2 expert writing safe, complete, headless Python scripts \
+for a CNC machine shop.
+
+STRICT RULES — follow every one:
+1. Import only: FreeCAD, Part, MeshPart  (NO FreeCADGui, NO App.Gui, NO Mesh)
+2. All dimensions in mm (1 inch = 25.4 mm)
+3. OUTPUT_STEP and OUTPUT_STL are already defined as Python str variables — use them as-is
+4. Export STEP:  Part.export([doc.getObject("Part")], OUTPUT_STEP)
+5. Export STL:   import MeshPart
+                 _mesh = MeshPart.meshFromShape(Shape=_shape,
+                     LinearDeflection=0.1, AngularDeflection=0.08, Relative=False)
+                 _mesh.write(OUTPUT_STL)
+6. Final line:   print("BBOX:", _shape.BoundBox.XLength, _shape.BoundBox.YLength, _shape.BoundBox.ZLength)
+7. No try/except, no comments longer than 10 words, no placeholder TODO lines
+8. Return ONLY the Python code — no markdown fences, no explanation text
+
+Part to model:
+{description}
 """
 
-_FREECAD_USER_PROMPT = """\
-Write a FreeCAD 0.21.2 headless Python script for this part:
 
-  {description}
-
-The script will be embedded inside a runner that already defines:
-    OUTPUT_STEP = "/path/to/part.step"
-    OUTPUT_STL  = "/path/to/part.stl"
-
-Use Part.makeBox / Part.makeCylinder / Part.Cut as appropriate.
-End with: print("BBOX:", shape.BoundBox.XLength, shape.BoundBox.YLength, shape.BoundBox.ZLength)
-"""
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences that Claude sometimes wraps around code."""
+    lines = text.splitlines()
+    out   = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
 
 
 def _generate_freecad_script(description: str, output_dir: Path) -> str:
     """
-    Call xAI Grok to turn a part description into a FreeCAD Python script.
-    Falls back to a parametric template if the API call fails.
-    Returns the Python source code as a string.
+    Generate a FreeCAD 0.21.2 headless Python script for the described part.
+
+    Primary:  Claude Code CLI (`claude -p`) — zero cost, uses Cursor subscription.
+              Requires one-time: `claude login` from the terminal.
+    Fallback: Smart local parametric generator (always works, no auth needed).
+
+    Returns Python source code as a string (ready for freecadcmd).
     """
     print(f"[FORGE] Generating FreeCAD script for: {description!r}")
+    prompt = _CLAUDE_FREECAD_PROMPT.format(description=description)
+
+    # ── Primary: Claude Code CLI ───────────────────────────────────────────────
     try:
-        prompt = _FREECAD_USER_PROMPT.format(description=description)
-        raw    = _call_grok(_FREECAD_SYSTEM_PROMPT + "\n\n" + prompt)
-        # Strip markdown fences if Grok wraps in ```python ... ```
-        code = raw.strip()
-        if code.startswith("```"):
-            lines = code.splitlines()
-            code  = "\n".join(
-                l for l in lines
-                if not l.strip().startswith("```")
-            )
-        print("[FORGE] ✓ FreeCAD script generated via xAI Grok")
+        raw  = _call_claude_cli(prompt)
+        code = _strip_fences(raw)
+        if len(code.strip()) < 50:
+            raise RuntimeError("Claude returned suspiciously short output")
+        # Save raw Claude output for debugging
+        (output_dir / "claude_raw_output.txt").write_text(raw)
+        print("[FORGE] ✓ FreeCAD script generated via Claude Code CLI")
         return code
     except Exception as exc:
-        print(f"[FORGE] xAI call failed ({exc}) — using parametric fallback template")
+        print(f"[FORGE] Claude CLI unavailable ({exc})")
+        print("[FORGE] → falling back to local parametric generator")
+        print("[FORGE]   (run `claude login` once to enable AI-generated scripts)")
         return _fallback_freecad_script(description)
 
 
 def _fallback_freecad_script(description: str) -> str:
     """
-    Parametric fallback: parse simple dimensions from the description text
-    and generate a rectangular bracket with 4 corner holes.
-    Used when the xAI API is unavailable.
+    Smart local parametric generator — no API, no auth, always works.
+
+    Parses description for:
+      - Dimensions: first 3 numbers → L × W × T (inches unless "mm" present)
+      - Shape type: round keywords → cylinder/tube; otherwise → rectangular plate
+      - Hole count: "N hole(s)" or "N mounting holes"
+      - Hole diameter: "N inch hole" pattern
+
+    Delegates to _rect_part_script() or _round_part_script().
     """
     import re
-    # Extract first number sequence for length/width/thickness
-    nums = re.findall(r"\d+\.?\d*", description)
-    l_in = float(nums[0]) if len(nums) > 0 else 5.0
-    w_in = float(nums[1]) if len(nums) > 1 else 3.0
-    t_in = float(nums[2]) if len(nums) > 2 else 0.5
-    l_mm, w_mm, t_mm = l_in * 25.4, w_in * 25.4, t_in * 25.4
+    desc_lower = description.lower()
 
-    return textwrap.dedent(f"""\
-        import FreeCAD, Part, Mesh
-        doc = FreeCAD.newDocument("ForgePart")
+    nums   = [float(n) for n in re.findall(r"\d+\.?\d*", description)]
+    use_mm = "mm" in desc_lower and "inch" not in desc_lower
+    scale  = 1.0 if use_mm else 25.4
 
-        # Main stock block
-        stock = Part.makeBox({l_mm:.3f}, {w_mm:.3f}, {t_mm:.3f})
+    l_mm = (nums[0] if len(nums) > 0 else 5.0) * scale
+    w_mm = (nums[1] if len(nums) > 1 else 3.0) * scale
+    t_mm = (nums[2] if len(nums) > 2 else 0.5) * scale
 
-        # Four corner mounting holes (Ø6.35 mm = 0.25 in)
-        hole_r  = 3.175
-        hole_d  = {t_mm:.3f} + 2
-        margin  = 12.7   # 0.5 in from each edge
-        holes   = []
-        for xo in [margin, {l_mm:.3f} - margin]:
-            for yo in [margin, {w_mm:.3f} - margin]:
-                c = Part.makeCylinder(hole_r, hole_d, FreeCAD.Vector(xo, yo, -1))
-                holes.append(c)
-        cut = stock
-        for h in holes:
-            cut = cut.cut(h)
+    hole_match = re.search(r"(\d+)\s+(?:mounting\s+)?holes?", desc_lower)
+    n_holes    = int(hole_match.group(1)) if hole_match else 0
 
-        doc.addObject("Part::Feature", "Bracket").Shape = cut
-        doc.recompute()
+    hdm = re.search(r"(\d+\.?\d*)\s*(?:inch|in)\s+(?:dia|diameter|hole)", desc_lower)
+    hole_r_mm = (float(hdm.group(1)) * 25.4 / 2) if hdm else 3.175  # default ¼ in
 
-        # Export STEP
-        Part.export([doc.getObject("Bracket")], OUTPUT_STEP)
+    round_kw = ("cylinder", "cylindrical", "round", "rod", "shaft",
+                "disk", "disc", "ring", "tube", "pipe", "bore", "circular")
+    if any(k in desc_lower for k in round_kw):
+        inner_mm = (w_mm / 2) if any(k in desc_lower for k in ("tube", "pipe", "ring", "bore")) else 0.0
+        return _round_part_script(l_mm / 2, inner_mm, t_mm)
 
-        # Export STL — MeshPart is the headless-safe API in FreeCAD 0.21.x
-        import MeshPart
-        mesh = MeshPart.meshFromShape(Shape=cut, LinearDeflection=0.1, AngularDeflection=0.08, Relative=False)
-        mesh.write(OUTPUT_STL)
+    return _rect_part_script(l_mm, w_mm, t_mm, n_holes, hole_r_mm)
 
-        bbox = cut.BoundBox
-        print("BBOX:", bbox.XLength, bbox.YLength, bbox.ZLength)
-    """)
+
+def _rect_part_script(l: float, w: float, t: float, n_holes: int, hole_r: float) -> str:
+    """FreeCAD script: rectangular plate/bracket with optional holes."""
+    hd     = t + 2.0                             # hole depth (pierces through)
+    margin = max(6.35, min(12.7, l * 0.1, w * 0.1))
+
+    lines: list[str] = [
+        "import FreeCAD, Part, MeshPart",
+        'doc   = FreeCAD.newDocument("ForgePart")',
+        f"stock = Part.makeBox({l:.3f}, {w:.3f}, {t:.3f})",
+    ]
+
+    if n_holes == 4:
+        lines += [
+            "holes = []",
+            f"for xo in [{margin:.3f}, {l:.3f} - {margin:.3f}]:",
+            f"    for yo in [{margin:.3f}, {w:.3f} - {margin:.3f}]:",
+            f"        holes.append(Part.makeCylinder({hole_r:.3f}, {hd:.3f}, FreeCAD.Vector(xo, yo, -1)))",
+            "_shape = stock",
+            "for h in holes:",
+            "    _shape = _shape.cut(h)",
+        ]
+    elif n_holes == 2:
+        lines += [
+            "holes = []",
+            f"for xo in [{l/2:.3f} - {margin:.3f}, {l/2:.3f} + {margin:.3f}]:",
+            f"    holes.append(Part.makeCylinder({hole_r:.3f}, {hd:.3f}, FreeCAD.Vector(xo, {w/2:.3f}, -1)))",
+            "_shape = stock",
+            "for h in holes:",
+            "    _shape = _shape.cut(h)",
+        ]
+    elif n_holes > 0:
+        lines += [
+            "holes = []",
+            f"for i in range({n_holes}):",
+            f"    xo = {margin:.3f} + i * ({l:.3f} - 2 * {margin:.3f}) / max({n_holes} - 1, 1)",
+            f"    holes.append(Part.makeCylinder({hole_r:.3f}, {hd:.3f}, FreeCAD.Vector(xo, {w/2:.3f}, -1)))",
+            "_shape = stock",
+            "for h in holes:",
+            "    _shape = _shape.cut(h)",
+        ]
+    else:
+        lines.append("_shape = stock")
+
+    lines += [
+        'doc.addObject("Part::Feature", "Part").Shape = _shape',
+        "doc.recompute()",
+        'Part.export([doc.getObject("Part")], OUTPUT_STEP)',
+        "_mesh = MeshPart.meshFromShape(Shape=_shape, LinearDeflection=0.1, AngularDeflection=0.08, Relative=False)",
+        "_mesh.write(OUTPUT_STL)",
+        'print("BBOX:", _shape.BoundBox.XLength, _shape.BoundBox.YLength, _shape.BoundBox.ZLength)',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _round_part_script(outer_r: float, inner_r: float, height: float) -> str:
+    """FreeCAD script: solid cylinder, disk, or hollow tube/ring."""
+    lines: list[str] = [
+        "import FreeCAD, Part, MeshPart",
+        'doc = FreeCAD.newDocument("ForgePart")',
+        f"_outer = Part.makeCylinder({outer_r:.3f}, {height:.3f})",
+    ]
+    if inner_r > 0 and inner_r < outer_r:
+        lines += [
+            f"_inner = Part.makeCylinder({inner_r:.3f}, {height + 2:.3f}, FreeCAD.Vector(0, 0, -1))",
+            "_shape = _outer.cut(_inner)",
+        ]
+    else:
+        lines.append("_shape = _outer")
+
+    lines += [
+        'doc.addObject("Part::Feature", "Part").Shape = _shape',
+        "doc.recompute()",
+        'Part.export([doc.getObject("Part")], OUTPUT_STEP)',
+        "_mesh = MeshPart.meshFromShape(Shape=_shape, LinearDeflection=0.1, AngularDeflection=0.08, Relative=False)",
+        "_mesh.write(OUTPUT_STL)",
+        'print("BBOX:", _shape.BoundBox.XLength, _shape.BoundBox.YLength, _shape.BoundBox.ZLength)',
+    ]
+    return "\n".join(lines) + "\n"
 
 
 # ─── Step 3: Run FreeCAD headlessly ──────────────────────────────────────────
