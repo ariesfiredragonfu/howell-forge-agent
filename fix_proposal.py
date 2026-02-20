@@ -190,8 +190,15 @@ def build_fix_proposal(
     ctx = extra_context or {}
 
     # ── AUTH_ERROR_401/403 on Kaito endpoints ─────────────────────────────────
-    # Match KaitoAPIError by type (endpoint path may not contain "kaito")
-    if error_type == "KaitoAPIError" and error_code in (401, 403):
+    # Match KaitoAPIError by type (endpoint path may not contain "kaito").
+    # error_code=0 means a connection / DNS failure — the API key is set to a
+    # non-empty value (disabling dev_mode) but the host is unreachable, which
+    # is identical in impact to a 401 (credentials never reached the server).
+    _kaito_auth_failure = error_type == "KaitoAPIError" and (
+        error_code in (401, 403)
+        or (error_code == 0 and "/payments" in (endpoint or ""))
+    )
+    if _kaito_auth_failure:
         return FixProposal(
             title="Rotate Kaito API Key",
             severity="CRITICAL",
@@ -200,14 +207,16 @@ def build_fix_proposal(
             order_id=order_id,
             timestamp=timestamp,
             root_cause=textwrap.dedent(f"""\
-                The Kaito Stablecoin Engine returned HTTP **{error_code}** on endpoint `{endpoint}`.
+                The Kaito Stablecoin Engine failed on endpoint `{endpoint}` \
+(HTTP {error_code if error_code else "connection error"}).
                 This indicates the Kaito API key stored in `~/.config/cursor-kaito-config`
-                is **expired, revoked, or missing**.
+                is **expired, revoked, missing, or dev_mode was disabled with no valid key set**.
 
                 Detail from fortress_errors.log: `{detail}`
 
-                Repeated 401/403 errors from `{agent}` indicate this is not a transient
-                network issue — the credential itself is invalid.
+                A code-0 (DNS/connection) error on a `/payments/` endpoint while
+                `dev_mode=false` is set has the same root cause as a 401 — the credentials
+                were insufficient to reach or authenticate against the Kaito API.
             """),
             files_affected=[
                 "~/.config/cursor-kaito-config",
