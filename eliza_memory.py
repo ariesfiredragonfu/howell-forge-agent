@@ -128,6 +128,11 @@ def get_pending_orders() -> list[dict]:
     return get_db().get_pending_orders()
 
 
+def get_all_orders(limit: int = 100) -> list[dict]:
+    """Return all orders newest-first, up to limit."""
+    return get_db().get_all_orders(limit=limit)
+
+
 # ─── Security Event API ───────────────────────────────────────────────────────
 
 def log_security_event(

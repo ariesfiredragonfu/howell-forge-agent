@@ -408,6 +408,13 @@ class SQLiteBackend(AbstractDatabaseInterface):
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_all_orders(self, limit: int = 100) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM orders ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Feature States ────────────────────────────────────────────────────────
 
     def get_feature_status(self, feature_name: str) -> Optional[str]:
