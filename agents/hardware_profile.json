@@ -1,0 +1,23 @@
+{
+  "hardware": {
+    "gpu": {
+      "detected": true,
+      "name": "NVIDIA T1200 Laptop GPU",
+      "vram_gb": 4.0,
+      "driver": "580.126.09"
+    },
+    "ram_gb": 31.1,
+    "cpu": {
+      "cores": 16,
+      "model": "11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz"
+    },
+    "ollama": true
+  },
+  "strategy": {
+    "tier": "HYBRID \u2014 CPU LOCAL",
+    "icon": "\u2696\ufe0f",
+    "local_model": "ollama/phi3:mini",
+    "cloud_model": "groq/llama-3.3-70b-versatile",
+    "note": "4 GB VRAM too tight for GPU offload, but 31.1 GB RAM handles CPU inference. Use local for lightweight agents (Quartermaster, logistics), Groq for CAD."
+  }
+}
