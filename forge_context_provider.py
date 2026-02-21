@@ -39,7 +39,9 @@ from eliza_providers import OrderStateProvider, SecurityContextProvider
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-FORGE_ORDERS_DIR = Path.home() / "Hardware_Factory" / "forge_orders"
+_default_orders  = Path.home() / "Hardware_Factory" / "forge_orders"
+FORGE_ORDERS_DIR = Path(os.getenv("FORGE_ORDERS_DIR", str(_default_orders)))
+FORGE_ORDERS_DIR.mkdir(parents=True, exist_ok=True)
 _order_provider    = OrderStateProvider()
 _security_provider = SecurityContextProvider()
 
@@ -100,21 +102,35 @@ def get_forge_status() -> dict:
 
 def _get_web3() -> "Web3 | None":
     """
-    Build a Web3 instance using the Alchemy RPC URL.
-    Returns None (gracefully) if web3 not installed or no API key configured.
+    Build a Web3 instance from the configured RPC URL.
+
+    Resolution order (first non-empty value wins):
+      1. POLYGON_RPC_URL   — full RPC URL (new, preferred — set in aria.env)
+      2. ALCHEMY_RPC_URL   — alias accepted for backward compatibility
+      3. ALCHEMY_KEY        — legacy bare key → URL built from it
+      4. eliza-config.json polygon.alchemy_key
     """
     try:
         from web3 import Web3
-        key = os.environ.get("ALCHEMY_KEY", "").strip()
-        if not key:
-            # Try reading from eliza-config
-            cfg_path = Path(__file__).parent / "eliza-config.json"
-            if cfg_path.exists():
-                cfg = json.loads(cfg_path.read_text())
-                key = cfg.get("polygon", {}).get("alchemy_key", "")
-        if not key:
+
+        # 1. Full URL (new style)
+        rpc = (os.environ.get("POLYGON_RPC_URL", "")
+               or os.environ.get("ALCHEMY_RPC_URL", "")).strip()
+
+        # 2. Bare key (legacy style)
+        if not rpc:
+            key = os.environ.get("ALCHEMY_KEY", "").strip()
+            if not key:
+                cfg_path = Path(__file__).parent / "eliza-config.json"
+                if cfg_path.exists():
+                    cfg = json.loads(cfg_path.read_text())
+                    key = cfg.get("polygon", {}).get("alchemy_key", "")
+            if key:
+                rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{key}"
+
+        if not rpc:
             return None
-        rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{key}"
+
         return Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 5}))
     except ImportError:
         return None

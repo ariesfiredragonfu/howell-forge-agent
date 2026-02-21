@@ -5,8 +5,14 @@
  */
 import { useRef, useEffect, useState } from 'react'
 
+const CATEGORY_COLORS = {
+  COLLISION: { bg: '#1a0a0a', border: '#7f1d1d', badge: '#ef4444' },
+  FINANCIAL: { bg: '#0a100a', border: '#14532d', badge: '#22c55e' },
+  PHYSICS:   { bg: '#0f0f1a', border: '#312e81', badge: '#818cf8' },
+}
+
 export default function AriaChat({ hook }) {
-  const { messages, streaming, connected, listening, sendMessage, toggleVoice } = hook
+  const { messages, streaming, connected, listening, interrupt, sendMessage, toggleVoice } = hook
   const [draft, setDraft] = useState('')
   const bottomRef = useRef(null)
 
@@ -78,40 +84,78 @@ export default function AriaChat({ hook }) {
           </div>
         )}
 
-        {messages.map((msg, i) => (
-          <div key={i} style={{
-            alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
-            maxWidth: '90%',
-          }}>
-            <div className="label" style={{
-              color: msg.role === 'user' ? '#3b82f6' : msg.role === 'system' ? '#4a4a6a' : '#8888aa',
-              marginBottom: 3,
-              textAlign: msg.role === 'user' ? 'right' : 'left',
+        {messages.map((msg, i) => {
+          const isInterrupt = msg.role === 'aria-interrupt'
+          const isUser      = msg.role === 'user'
+          const isSystem    = msg.role === 'system'
+          const colors      = isInterrupt ? (CATEGORY_COLORS[msg.category] || CATEGORY_COLORS.COLLISION) : null
+
+          return (
+            <div key={i} style={{
+              alignSelf: isUser ? 'flex-end' : 'flex-start',
+              maxWidth: '92%',
+              animation: isInterrupt ? 'interruptFlash 0.3s ease-out' : 'none',
             }}>
-              {msg.role === 'user' ? 'YOU' : msg.role === 'system' ? '— SYSTEM —' : 'ARIA'}
+              {/* Label row */}
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                marginBottom: 3,
+                justifyContent: isUser ? 'flex-end' : 'flex-start',
+              }}>
+                {isInterrupt && (
+                  <span style={{
+                    background: colors.badge,
+                    color: '#fff',
+                    fontSize: '0.6rem',
+                    fontFamily: 'monospace',
+                    letterSpacing: '0.12em',
+                    padding: '1px 6px',
+                    borderRadius: 2,
+                    fontWeight: 700,
+                  }}>
+                    ⚠ {msg.category || 'INTERRUPT'}
+                  </span>
+                )}
+                <span className="label" style={{
+                  color: isUser ? '#3b82f6' : isSystem ? '#4a4a6a' : isInterrupt ? colors.badge : '#8888aa',
+                }}>
+                  {isUser ? 'YOU' : isSystem ? '— SYSTEM —' : isInterrupt ? 'ARIA ✕' : 'ARIA'}
+                </span>
+              </div>
+
+              {/* Bubble */}
+              <div style={{
+                background: isUser
+                  ? '#0f1729'
+                  : isSystem
+                    ? 'transparent'
+                    : isInterrupt
+                      ? colors.bg
+                      : '#111120',
+                border: `1px solid ${
+                  isUser ? '#1e2d4a' :
+                  isSystem ? 'transparent' :
+                  isInterrupt ? colors.border :
+                  '#1e1e3a'
+                }`,
+                borderLeft: isInterrupt ? `3px solid ${colors.badge}` : undefined,
+                borderRadius: 4,
+                padding: isSystem ? '2px 0' : '8px 12px',
+                fontSize: '0.78rem',
+                lineHeight: 1.6,
+                color: isSystem ? '#3a3a5a' : isInterrupt ? '#f8d7d7' : '#c8c8e8',
+                whiteSpace: 'pre-wrap',
+                fontFamily: 'monospace',
+                boxShadow: isInterrupt ? `0 0 12px ${colors.badge}44` : 'none',
+              }}>
+                {msg.text}
+                {msg.streaming && (
+                  <span style={{ animation: 'blink 1s infinite', color: '#3b82f6' }}>▋</span>
+                )}
+              </div>
             </div>
-            <div style={{
-              background: msg.role === 'user'
-                ? '#0f1729'
-                : msg.role === 'system'
-                  ? 'transparent'
-                  : '#111120',
-              border: `1px solid ${msg.role === 'user' ? '#1e2d4a' : msg.role === 'system' ? 'transparent' : '#1e1e3a'}`,
-              borderRadius: 4,
-              padding: msg.role === 'system' ? '2px 0' : '8px 12px',
-              fontSize: '0.78rem',
-              lineHeight: 1.6,
-              color: msg.role === 'system' ? '#3a3a5a' : '#c8c8e8',
-              whiteSpace: 'pre-wrap',
-              fontFamily: 'monospace',
-            }}>
-              {msg.text}
-              {msg.streaming && (
-                <span style={{ animation: 'blink 1s infinite', color: '#3b82f6' }}>▋</span>
-              )}
-            </div>
-          </div>
-        ))}
+          )
+        })}
         <div ref={bottomRef} />
       </div>
 
@@ -157,8 +201,12 @@ export default function AriaChat({ hook }) {
       </form>
 
       <style>{`
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
-        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes blink         { 0%,100%{opacity:1} 50%{opacity:0} }
+        @keyframes pulse         { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes interruptFlash {
+          0%   { background: rgba(239,68,68,0.15); }
+          100% { background: transparent; }
+        }
       `}</style>
     </div>
   )

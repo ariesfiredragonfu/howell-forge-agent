@@ -186,13 +186,38 @@ def get_circuit_state() -> dict:
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 def _load_config() -> dict:
+    """
+    Load Kaito config. Resolution order (later entries override earlier):
+      1. Built-in defaults (_DEFAULT_CONFIG)
+      2. ~/.config/cursor-kaito-config JSON file
+      3. Environment variables — KAITO_API_KEY, WALLET_ADDRESS, POLYGON_RPC_URL
+         These win over the file so aria.env is always authoritative.
+    """
+    import os
+    cfg = dict(_DEFAULT_CONFIG)
+
     if KAITO_CONFIG_PATH.exists():
         try:
             raw = json.loads(KAITO_CONFIG_PATH.read_text())
-            return {**_DEFAULT_CONFIG, **raw}
+            cfg.update(raw)
         except (json.JSONDecodeError, OSError):
             pass
-    return dict(_DEFAULT_CONFIG)
+
+    # Environment overrides — aria.env values always win
+    env_key    = os.environ.get("KAITO_API_KEY",    "").strip()
+    env_wallet = os.environ.get("WALLET_ADDRESS",   "").strip()
+    env_rpc    = (os.environ.get("POLYGON_RPC_URL", "")
+                  or os.environ.get("ALCHEMY_RPC_URL", "")).strip()
+
+    if env_key:    cfg["api_key"]        = env_key
+    if env_wallet: cfg["wallet_address"] = env_wallet
+    if env_rpc:    cfg["rpc_url"]        = env_rpc
+
+    # If a real key is present via env, disable dev mode automatically
+    if env_key and cfg.get("dev_mode", True):
+        cfg["dev_mode"] = False
+
+    return cfg
 
 
 def _is_dev(cfg: dict) -> bool:

@@ -1,0 +1,173 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Howell Forge — docker-compose.yml
+# Replaces the Replit "Run" button.
+#
+# QUICK START (local machine):
+#   cp aria.env.example aria.env     # fill in your keys
+#   docker compose up --build
+#   → Mission Control  http://localhost:3000
+#   → Forge API        http://localhost:8765
+#   → Redis (debug)    localhost:6380   (6379 stays free for host Redis)
+#
+# QUICK START (voice worker too):
+#   docker compose --profile voice up --build
+#
+# PRODUCTION (remote server):
+#   Set FORGE_API_HOST in aria.env to your server's public IP/hostname.
+#   docker compose -f docker-compose.yml up -d --build
+#
+# PULL pre-built image instead of building:
+#   Comment out the `build:` block under aria-brain and uncomment `image:`.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Shared internal network — services talk to each other by service name
+networks:
+  forge-net:
+    driver: bridge
+
+# Named volumes — persisted across container restarts
+volumes:
+  redis-data:           # Redis AOF + RDB persistence
+  forge-exports:        # G-code, STEP, STL output from FreeCAD
+
+services:
+
+  # ── 1. redis-memory ─────────────────────────────────────────────────────────
+  # The shop's short-term memory:
+  #   • biofeedback EWMA stream
+  #   • forge:status key
+  #   • mission_control_events pub/sub channel (camera moves, fixture updates)
+  redis-memory:
+    image: redis:7-alpine
+    container_name: forge-redis
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      # Only bind to host if nothing else is using 6379.
+      # Containers reach Redis via service name "redis-memory" on forge-net.
+      # Comment this line out if your host already runs Redis on 6379.
+      - "127.0.0.1:6380:6379"   # mapped to 6380 so it never conflicts
+    networks:
+      - forge-net
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── 2. aria-brain ────────────────────────────────────────────────────────────
+  # The Forge Nervous System:
+  #   • LangGraph 5-node graph (parse_intent → generate_cad → validate_safety
+  #                              → check_finances → respond)
+  #   • FreeCAD headless via persistent Xvfb :99 (started by entrypoint)
+  #   • FastAPI Forge API — WebSocket + REST
+  #
+  # Runs as UID 1001 (the `forge` user created in the Dockerfile).
+  # This must match so named volume mounts don't reset ownership to root.
+  aria-brain:
+    build:
+      context: .                  # repo root — Dockerfile is here
+      dockerfile: Dockerfile
+    user: "1001:1001"             # forge:forge — matches Dockerfile USER
+    container_name: forge-brain
+    # Uncomment to pull the pre-built image from GitHub Packages instead:
+    # image: ghcr.io/ariesfiredragonfu/howell-forge-agent:latest
+    env_file:
+      - aria.env                  # The Secret Handshake — never committed to git
+    environment:
+      # Override Redis host to use the Docker service name, not localhost
+      - REDIS_HOST=redis-memory
+      - REDIS_PORT=6379
+      # FreeCAD headless (xvfb virtual display)
+      - QT_QPA_PLATFORM=offscreen
+      - LIBGL_ALWAYS_SOFTWARE=1
+      # Forge orders directory — points at the bind-mounted host path so orders
+      # created on the host (or by forge_manager_v1 running locally) are visible
+      # inside the container and therefore in the dashboard.
+      - FORGE_ORDERS_DIR=/data/forge_orders
+    volumes:
+      # Bind mount: host ~/Hardware_Factory/forge_orders → /data/forge_orders
+      # This is the single source of truth for all order STL/STEP/G-code files.
+      # forge_manager_v1 writes here; forge_api reads from here; ForgeViewer loads from here.
+      - ${HOME}/Hardware_Factory/forge_orders:/data/forge_orders
+      # Named volume for the /app/exports scratch space (first_contact test etc.)
+      - forge-exports:/app/exports
+      # Machine config is read-only inside the container
+      - ./machine_config.json:/app/machine_config.json:ro
+    ports:
+      - "8765:8765"               # Forge API — browser WebSockets connect here
+    networks:
+      - forge-net
+    depends_on:
+      redis-memory:
+        condition: service_healthy
+    restart: always
+    healthcheck:
+      # TCP socket check — no Python subprocess overhead, just confirms port 8765 is open.
+      test: ["CMD", "python3", "-c",
+             "import socket; s=socket.create_connection(('127.0.0.1',8765),2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── 3. mission-control ───────────────────────────────────────────────────────
+  # The React dashboard — built by Vite, served by nginx.
+  # nginx also proxies /ws/* and /api/* to aria-brain so you only need one
+  # public port (3000) in production.
+  mission-control:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        # Injected at Vite build time — baked into the JS bundle.
+        # LOCAL: use localhost:8765 (browser talks directly to exposed port)
+        # REMOTE SERVER: set to your-server-ip:8765 in aria.env
+        VITE_FORGE_API_HOST: ${FORGE_API_HOST:-localhost:8765}
+    container_name: forge-dashboard
+    ports:
+      - "3000:3000"               # Mission Control UI
+    networks:
+      - forge-net
+    depends_on:
+      - aria-brain
+    restart: always
+    healthcheck:
+      test: ["CMD", "sh", "-c", "printf 'GET / HTTP/1.0\r\n\r\n' | nc localhost 3000 | grep -q HTTP"]
+      interval: 15s
+      timeout: 4s
+      retries: 3
+
+  # ── 4. voice-worker (opt-in) ─────────────────────────────────────────────────
+  # ARIA's LiveKit voice bridge — connect your mic and speak to the shop.
+  # Only started when you run: docker compose --profile voice up
+  voice-worker:
+    profiles: [voice]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: forge-voice
+    user: "1001:1001"             # forge:forge — same as aria-brain
+    command: python3 voice_worker.py dev
+    env_file:
+      - aria.env
+    environment:
+      - REDIS_HOST=redis-memory
+      - FORGE_API_URL=http://aria-brain:8765
+      - FORGE_ORDERS_DIR=/data/forge_orders
+    volumes:
+      - ${HOME}/Hardware_Factory/forge_orders:/data/forge_orders
+      - forge-exports:/app/exports
+    networks:
+      - forge-net
+    depends_on:
+      aria-brain:
+        condition: service_healthy
+    restart: on-failure:3

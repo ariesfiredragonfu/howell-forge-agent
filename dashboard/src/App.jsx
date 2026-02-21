@@ -8,8 +8,8 @@
  * ARIA chat: streaming Claude Code CLI via WebSocket
  * Voice: browser Web Speech API — say "Forge" to wake ARIA
  */
-import { useState } from 'react'
-import Viewport3D  from './components/Viewport3D'
+import { useState, useEffect } from 'react'
+import ForgeViewer from './components/ForgeViewer'
 import StatusPanel from './components/StatusPanel'
 import AriaChat    from './components/AriaChat'
 import OrderQueue  from './components/OrderQueue'
@@ -21,11 +21,29 @@ export default function App() {
   const ariaHook = useAriaChat()
   const [selectedOrder, setSelectedOrder] = useState(null)
   const [stlUrl, setStlUrl]               = useState(null)
+  const [ariaViewCmd, setAriaViewCmd]     = useState(null)
 
   const handleSelectOrder = (order, url) => {
     setSelectedOrder(order)
     setStlUrl(url)
   }
+
+  // Listen for ARIA forge_view commands in the chat message stream
+  // e.g. ARIA sends: {"type":"forge_view","toggle":"workholding","visible":false}
+  useEffect(() => {
+    const msgs = ariaHook.messages
+    if (!msgs.length) return
+    const last = msgs[msgs.length - 1]
+    if (last?.role === 'aria' && last.text) {
+      const match = last.text.match(/\{"type"\s*:\s*"forge_view"[^}]+\}/)
+      if (match) {
+        try {
+          const cmd = JSON.parse(match[0])
+          setAriaViewCmd({ ...cmd, ts: Date.now() })
+        } catch { /* ignore malformed */ }
+      }
+    }
+  }, [ariaHook.messages])
 
   const bf = ctx?.biofeedback
   const healthColor = {
@@ -99,10 +117,10 @@ export default function App() {
           <OrderQueue ctx={ctx} onSelectOrder={handleSelectOrder} />
         </div>
 
-        {/* 3D viewport — center */}
+        {/* 3D Work Zone — ForgeViewer with Environment/Workholding groups */}
         <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ flex: 1, overflow: 'hidden' }}>
-            <Viewport3D stlUrl={stlUrl} />
+            <ForgeViewer stlUrl={stlUrl} ariaViewCmd={ariaViewCmd} />
           </div>
 
           {/* Selected order info bar */}

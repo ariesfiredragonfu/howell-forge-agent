@@ -1,0 +1,38 @@
+{
+  "machine_specs": {
+    "name": "Howell_Forge_Main_CNC",
+    "build_volume": { "x": 500, "y": 400, "z": 400 },
+    "home_position": [0, 0, 0]
+  },
+  "workholding_library": {
+    "standard_vise": {
+      "type": "fixed_vise",
+      "dimensions": { "length": 152.4, "width": 100.0, "height": 73.0 },
+      "no_fly_zone_buffer": 5.0,
+      "description": "6-inch Kurt-style vise. Fixed jaw faces +X. Height measured from table surface."
+    },
+    "toe_clamp_set": {
+      "type": "strap_clamp",
+      "dimensions": { "length": 50.0, "width": 20.0, "height": 15.0 },
+      "no_fly_zone_buffer": 2.0,
+      "description": "Standard toe clamp / strap clamp. Can be placed anywhere on table T-slots."
+    }
+  },
+  "active_layout": {
+    "current_fixtures": [
+      {
+        "id": "vise_01",
+        "type": "standard_vise",
+        "position": [0, 0, 0],
+        "rotation": 0,
+        "status": "active"
+      }
+    ]
+  },
+  "_notes": {
+    "units": "mm",
+    "coordinate_system": "machine zero at home_position [0,0,0]. X+ = right, Y+ = into machine, Z+ = up.",
+    "no_fly_zone": "Tool center must stay outside fixture footprint + no_fly_zone_buffer at all times.",
+    "last_updated": "2026-02-20"
+  }
+}

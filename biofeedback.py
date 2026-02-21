@@ -33,6 +33,7 @@ scaler.py reads get_score() instead of counting file lines.
 """
 
 import json
+import logging
 import math
 import time
 from datetime import datetime, timezone
@@ -50,6 +51,8 @@ EWMA_STATE_PATH  = BIOFEEDBACK_DIR / "ewma_state.json"
 INSERT_MARKER = "---\n\n"
 
 _CONFIG_PATH = Path(__file__).parent / "eliza-config.json"
+
+logger = logging.getLogger(__name__)
 
 # ─── Config reader ────────────────────────────────────────────────────────────
 
@@ -162,6 +165,7 @@ def get_adaptive_weight(
     base_weight: float,
     event_type: str,
     _now_ts: Optional[float] = None,
+    _log: bool = True,
 ) -> tuple[float, str]:
     """
     Return (effective_weight, boost_note) for the given base weight.
@@ -176,6 +180,8 @@ def get_adaptive_weight(
     without a repeat the count falls to 0 and the weight reverts to base.
 
     Returns (base_weight, "") when adaptive is disabled or Redis is down.
+
+    _log=False suppresses the INFO log (used by status queries to avoid noise).
     """
     cfg = _get_adaptive_config()
     if not cfg:
@@ -188,20 +194,59 @@ def get_adaptive_weight(
         threshold = cfg.get("constraint_repeat_threshold", 3)
         factor    = cfg.get("constraint_boost_factor", 1.5)
         if count >= threshold:
-            return (
-                base_weight * factor,
-                f"adaptive boost {factor}× applied (count_{decay_hours}h={count} ≥ {threshold})",
-            )
+            effective = base_weight * factor
+            note = f"adaptive boost {factor}× applied (count_{decay_hours}h={count} ≥ {threshold})"
+            if _log:
+                logger.info(
+                    "Adaptive boost applied: %s %+.1f → %+.1f (%d repeats in %dh)",
+                    event_type, base_weight, effective, count, decay_hours,
+                )
+            return effective, note
     elif base_weight > 0:
         threshold = cfg.get("reward_rare_threshold", 1)
         factor    = cfg.get("reward_boost_factor", 1.2)
         if count <= threshold:
-            return (
-                base_weight * factor,
-                f"adaptive boost {factor}× applied (count_{decay_hours}h={count} ≤ {threshold})",
-            )
+            effective = base_weight * factor
+            note = f"adaptive boost {factor}× applied (count_{decay_hours}h={count} ≤ {threshold})"
+            if _log:
+                logger.info(
+                    "Adaptive boost applied: %s %+.1f → %+.1f (%d repeats in %dh)",
+                    event_type, base_weight, effective, count, decay_hours,
+                )
+            return effective, note
 
     return base_weight, ""
+
+
+# ─── Telegram boost alert (once-per-day gate via Redis TTL key) ───────────────
+
+_BOOST_ALERT_KEY_PREFIX = "howell:biofeedback:boost_alert_today"
+
+
+def _maybe_send_boost_alert(
+    event_type: str,
+    base_weight: float,
+    effective_weight: float,
+) -> None:
+    """
+    Send a Telegram alert on the first boost of the day for this event_type.
+
+    Uses a Redis key with a 24-hour TTL as the once-per-day gate so only one
+    alert fires per type per calendar-rolling day regardless of event volume.
+    Best-effort — never raises; silent when Redis or webhook is unavailable.
+    """
+    r = _get_redis()
+    if r is None:
+        return
+    try:
+        key = f"{_BOOST_ALERT_KEY_PREFIX}:{event_type}"
+        if not r.set(key, "1", ex=86400, nx=True):
+            return  # already alerted today for this type
+        from notifications import send_telegram_alert  # noqa: PLC0415
+        factor = abs(effective_weight / base_weight) if base_weight != 0 else 0
+        send_telegram_alert(f"Boost active: {event_type} ×{factor:.2g}")
+    except Exception:
+        pass
 
 
 # ─── EWMA constants ───────────────────────────────────────────────────────────
@@ -381,6 +426,10 @@ def record_event(
     # ── Adaptive weight (query stream BEFORE this event is added) ─────────────
     effective_weight, boost_note = get_adaptive_weight(base_weight, event_type, _now_ts=_now_ts)
 
+    # ── Optional: Telegram alert on first boost of the day ────────────────────
+    if boost_note:
+        _maybe_send_boost_alert(event_type, base_weight, effective_weight)
+
     # ── Append to Redis event stream ──────────────────────────────────────────
     _stream_xadd(event_type, base_weight, now_ts)
 
@@ -440,6 +489,61 @@ def get_ewma_state() -> dict:
     state["current_score"] = get_score()
     state["half_life_days"] = HALF_LIFE_DAYS
     return state
+
+
+def get_biofeedback_status(_now_ts: Optional[float] = None) -> dict:
+    """
+    Return a live status snapshot of the biofeedback system.
+
+    Returns:
+        {
+            "current_score": float,        # EWMA score decayed to right now
+            "scale_mode":    str,          # "high" | "normal" | "throttle"
+            "recent_counts": {type: int},  # event count per type in last 48h
+            "active_boosts": {type: str},  # boost note per currently boosted type
+        }
+
+    Scale mode is computed inline (mirrors scaler.py thresholds from config)
+    to avoid the circular import that would arise from importing scaler here.
+    Adaptive weight queries use _log=False to suppress per-type log noise.
+    _now_ts is injectable for deterministic tests; None → time.time().
+    """
+    _ts = _now_ts if _now_ts is not None else time.time()
+
+    # Compute current score respecting the optional mock timestamp
+    if _now_ts is not None and _use_ewma():
+        state = _load_ewma()
+        score = max(SCORE_FLOOR, _decay(state["score"], state.get("last_event_ts"), _ts))
+    else:
+        score = get_score()
+
+    cfg        = _load_config()
+    thresholds = cfg.get("thresholds", {})
+    high_thresh     = thresholds.get("high",     3.0)
+    throttle_thresh = thresholds.get("throttle", -2.0)
+
+    if score >= high_thresh:
+        scale_mode = "high"
+    elif score <= throttle_thresh:
+        scale_mode = "throttle"
+    else:
+        scale_mode = "normal"
+
+    recent_counts: dict[str, int] = {}
+    active_boosts: dict[str, str] = {}
+
+    for etype, base in EVENT_WEIGHTS.items():
+        recent_counts[etype] = get_recent_event_count(etype, hours=48, _now_ts=_ts)
+        eff, note = get_adaptive_weight(base, etype, _now_ts=_ts, _log=False)
+        if eff != base:
+            active_boosts[etype] = note
+
+    return {
+        "current_score": round(score, 4),
+        "scale_mode":    scale_mode,
+        "recent_counts": recent_counts,
+        "active_boosts": active_boosts,
+    }
 
 
 # ─── Human-readable markdown logs ─────────────────────────────────────────────

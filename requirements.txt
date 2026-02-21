@@ -1,0 +1,36 @@
+# ── Howell Forge Agent — Python dependencies ──────────────────────────────────
+# Install: pip install -r requirements.txt
+# Python 3.11+ required (matches python:3.11-slim-bookworm Docker base).
+
+# ── AI / LangGraph ────────────────────────────────────────────────────────────
+langgraph>=0.2
+langchain-core>=0.3
+langchain-openai>=0.2        # OpenAI-specific LangChain integrations (ChatOpenAI, embeddings)
+openai>=1.30
+
+# ── Pydantic AI ───────────────────────────────────────────────────────────────
+pydantic-ai>=0.0.13          # Pydantic's structured AI agent framework (tool calls, validation)
+pydantic>=2.6
+
+# ── LiveKit voice bridge ──────────────────────────────────────────────────────
+livekit-agents>=0.12
+livekit-plugins-openai>=0.10
+
+# ── API server ────────────────────────────────────────────────────────────────
+fastapi>=0.111
+uvicorn[standard]>=0.30
+aiohttp>=3.9
+
+# ── Redis (biofeedback, pub/sub, forge status) ────────────────────────────────
+redis>=5.0
+
+# ── Blockchain / Kaito ────────────────────────────────────────────────────────
+web3>=6.15
+
+# ── Visualisation (G-code toolpath, STL previews) ────────────────────────────
+matplotlib>=3.8
+numpy>=1.26
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0
+requests>=2.31

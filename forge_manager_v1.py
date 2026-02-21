@@ -44,7 +44,9 @@ from notifications import send_telegram_alert
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 CLAUDE_CLI        = Path.home() / ".local" / "bin" / "claude"   # installed by Claude Code
-OUTPUT_BASE       = Path.home() / "Hardware_Factory" / "forge_orders"
+_default_orders   = Path.home() / "Hardware_Factory" / "forge_orders"
+OUTPUT_BASE       = Path(os.getenv("FORGE_ORDERS_DIR", str(_default_orders)))
+OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 FREECADCMD        = "freecadcmd"
 AGENT_NAME        = "FORGE_MANAGER"
 GCODE_VALIDATOR   = Path(__file__).parent / "gcode_validator.py"

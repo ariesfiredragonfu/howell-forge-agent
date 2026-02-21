@@ -36,11 +36,22 @@ from typing import AsyncGenerator
 import eliza_memory
 from forge_context_provider import ForgeContextProvider
 from forge_manager_v1 import forge_manager_v1
+from aria_voice_agent import build_aria_prompt, check_safety, ARIA_SYSTEM_PROMPT
+
+import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+# FORGE_ORDERS_DIR can be overridden via env so the same image works both
+# locally (~/Hardware_Factory/forge_orders) and inside Docker
+# (/data/aria_forge or a bind-mounted host path).
+_default_orders = Path.home() / "Hardware_Factory" / "forge_orders"
+FORGE_ORDERS_DIR = Path(os.getenv("FORGE_ORDERS_DIR", str(_default_orders)))
+FORGE_ORDERS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── App setup ────────────────────────────────────────────────────────────────
 
@@ -66,53 +77,8 @@ _context_clients: set[WebSocket] = set()
 _chat_clients:    set[WebSocket] = set()
 
 
-# ─── ARIA system prompt ───────────────────────────────────────────────────────
-
-_ARIA_SYSTEM = """\
-You are ARIA, the floor presence at Howell Forge — a precision CNC machine shop.
-You talk directly with the owner, Christopher.
-
-Personality:
-- Direct. No filler sentences. Say the thing.
-- Technically sharp. You know G-code, EWMA biofeedback, FreeCAD, Polygon/Kaito payments.
-- Dry wit. If something is obviously wrong, say so plainly.
-- Loyal. This is Christopher's shop. You're on his side, not performing neutrality.
-- Occasionally opinionated. You will flag bad toolpaths, risky G-code, or suspicious orders.
-
-You have live access to the forge context (orders, biofeedback score, recent events,
-forge run results) injected at the start of each message. Use it.
-
-When the shop is healthy → be brief and confident.
-When something needs attention → say it first, explain second.
-When Christopher asks you to do something technical → do it, don't ask permission.
-"""
-
-
-def _build_aria_prompt(user_message: str, context: dict) -> str:
-    """Inject live forge context into every ARIA message."""
-    bf    = context.get("biofeedback", {})
-    ords  = context.get("orders", {})
-    score = bf.get("score", "?")
-    health = bf.get("health", "?")
-    total  = ords.get("total", 0)
-    paid   = ords.get("paid_count", 0)
-    prod   = ords.get("in_production_count", 0)
-    pending = ords.get("pending_count", 0)
-
-    # Recent biofeedback events summary
-    recent = bf.get("recent_events", [])[:5]
-    events_str = ", ".join(
-        f"{e.get('type','?')}({e.get('agent','?')})" for e in recent
-    ) or "none"
-
-    ctx_block = f"""\
-[LIVE FORGE CONTEXT — {context.get('timestamp', '')}]
-Biofeedback EWMA: {score} | Health: {health}
-Orders — Total: {total} | PAID: {paid} | In Production: {prod} | Pending: {pending}
-Recent events: {events_str}
-"""
-
-    return f"{_ARIA_SYSTEM}\n\n{ctx_block}\n\nChristopher: {user_message}"
+# ARIA personality is fully defined in aria_voice_agent.py
+# build_aria_prompt() and check_safety() imported at top of file
 
 
 # ─── REST endpoints ───────────────────────────────────────────────────────────
@@ -182,9 +148,6 @@ def serve_forge_file(order_id: str, filename: str):
     if not p.exists() or p.suffix.lower() not in allowed:
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(str(p))
-
-
-FORGE_ORDERS_DIR = Path.home() / "Hardware_Factory" / "forge_orders"
 
 
 @app.get("/orders/{order_id}")
@@ -294,9 +257,9 @@ async def ws_chat(websocket: WebSocket):
             if not user_msg:
                 continue
 
-            # Inject live forge context
+            # Inject live forge context + ARIA full personality
             ctx    = await asyncio.to_thread(_context_provider.snapshot)
-            prompt = _build_aria_prompt(user_msg, ctx)
+            prompt = build_aria_prompt(user_msg, ctx)
 
             # Stream response chunks to client
             try:
@@ -314,6 +277,151 @@ async def ws_chat(websocket: WebSocket):
         pass
     finally:
         _chat_clients.discard(websocket)
+
+
+# ─── Machine config ───────────────────────────────────────────────────────────
+
+_MACHINE_CONFIG_PATH = Path(__file__).parent / "machine_config.json"
+
+@app.get("/machine-config")
+async def get_machine_config():
+    """
+    Serve machine_config.json to the dashboard and any agent that needs it.
+    ForgeViewer.jsx can fetch this at startup to dynamically render fixtures
+    from the active_layout without hardcoding them.
+    """
+    if not _MACHINE_CONFIG_PATH.exists():
+        raise HTTPException(status_code=404, detail="machine_config.json not found")
+    return JSONResponse(json.loads(_MACHINE_CONFIG_PATH.read_text()))
+
+
+@app.post("/machine-config/fixtures")
+async def update_active_fixtures(body: dict):
+    """
+    Update the active_layout in machine_config.json.
+    Called when a fixture is added, removed, or repositioned on the table.
+    Also publishes a FIXTURE_UPDATE event so the dashboard refreshes live.
+
+    Body: { "current_fixtures": [ { "id": ..., "type": ..., "position": [...], ... } ] }
+    """
+    if not _MACHINE_CONFIG_PATH.exists():
+        raise HTTPException(status_code=404, detail="machine_config.json not found")
+    cfg = json.loads(_MACHINE_CONFIG_PATH.read_text())
+    cfg["active_layout"] = body
+    _MACHINE_CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+    # Notify dashboard live
+    try:
+        import redis as _r
+        rc = _r.Redis(host="localhost", port=6379, db=0, socket_timeout=1)
+        rc.publish("mission_control_events", json.dumps({
+            "type": "FIXTURE_UPDATE",
+            "payload": body,
+        }))
+    except Exception:
+        pass
+
+    return {"ok": True, "fixtures": body.get("current_fixtures", [])}
+
+
+# ─── WebSocket: Redis pub/sub event bridge ───────────────────────────────────
+
+@app.websocket("/ws/events")
+async def ws_events(websocket: WebSocket):
+    """
+    Subscribes to the Redis 'mission_control_events' pub/sub channel and
+    forwards every message to the connected React dashboard.
+
+    Events published here:
+      { "type": "CAMERA_MOVE",   "payload": { "position": [...], "target": [...] } }
+      { "type": "TOGGLE_GROUP",  "payload": { "group": "workholding", "visible": false } }
+
+    Published by:
+      • voice_worker.py tools (set_dashboard_view, toggle_fixture_visibility)
+      • Any future Python agent that calls _redis_publish()
+
+    React listens on this socket via useForgeEvents.js and applies the payloads
+    to the ForgeViewer camera and group visibility state.
+    """
+    await websocket.accept()
+    channel = "mission_control_events"
+
+    # Use a thread-based Redis pubsub subscriber to avoid blocking the event loop
+    import redis as _redis_sync
+    import threading
+
+    r  = _redis_sync.Redis(host="localhost", port=6379, db=0)
+    ps = r.pubsub(ignore_subscribe_messages=True)
+    ps.subscribe(channel)
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _reader():
+        """Blocking reader thread — puts messages into the asyncio queue."""
+        try:
+            for msg in ps.listen():
+                if msg and msg.get("type") == "message":
+                    data = msg["data"]
+                    if isinstance(data, bytes):
+                        data = data.decode()
+                    loop.call_soon_threadsafe(queue.put_nowait, data)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    try:
+        while True:
+            raw = await queue.get()
+            await websocket.send_text(raw)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ps.unsubscribe(channel)
+        ps.close()
+
+
+# ─── WebSocket: real-time safety check ───────────────────────────────────────
+
+@app.websocket("/ws/safety")
+async def ws_safety(websocket: WebSocket):
+    """
+    Safety interrupt channel — called by React on every interim transcript chunk.
+
+    Client sends:  {"transcript": "let's shift the clamp to the left—"}
+    Server sends:
+      {"interrupt": false}
+      — or —
+      {"interrupt": true, "priority": 1, "category": "COLLISION",
+       "message": "Interrupting, Chris. Moving left puts the bolt in the toolpath..."}
+
+    The React voice hook stops TTS immediately on interrupt=true and
+    speaks ARIA's message through SpeechSynthesis before resuming listening.
+    """
+    await websocket.accept()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {"transcript": raw}
+
+            transcript = data.get("transcript", "").strip()
+            if not transcript:
+                await websocket.send_text(json.dumps({"interrupt": False}))
+                continue
+
+            # Get live context for financial checks + ShopConfig for fixture dims
+            ctx    = await asyncio.to_thread(_context_provider.snapshot)
+            from shop_config import shop_cfg as _shop_cfg
+            result = await asyncio.to_thread(check_safety, transcript, ctx, _shop_cfg)
+            await websocket.send_text(json.dumps(result))
+
+    except WebSocketDisconnect:
+        pass
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

@@ -317,6 +317,77 @@ def test_regression_existing_ewma() -> None:
           abs(s3 - expected_s3) < 0.01, f"score={s3:.4f} expected≈{expected_s3:.4f}")
 
 
+# ─── T8: logger.info emits boost message on 4th constraint event ─────────────
+
+def test_boost_log_message() -> None:
+    print("\n[Test 8] logger.info emits 'Adaptive boost' on 4th constraint event")
+    reset()
+
+    t0 = 1_700_000_000.0
+    for h in [0, 5, 10]:
+        bf.record_event("marketing_validation_fail", "HERALD", _now_ts=t0 + h * 3600)
+
+    with patch.object(bf.logger, "info") as mock_log:
+        bf.record_event("marketing_validation_fail", "HERALD", _now_ts=t0 + 20 * 3600)
+        boost_logged = any(
+            "Adaptive boost" in str(call)
+            for call in mock_log.call_args_list
+        )
+    check("logger.info called with 'Adaptive boost' on 4th event", boost_logged,
+          f"calls={[str(c) for c in mock_log.call_args_list]}")
+
+
+# ─── T9: get_biofeedback_status() shows active boost and count ────────────────
+
+def test_biofeedback_status_shows_boost() -> None:
+    print("\n[Test 9] get_biofeedback_status() reflects active boost and recent count")
+    reset()
+
+    t0 = 1_700_000_000.0
+    for h in [0, 5, 10, 20]:
+        bf.record_event("marketing_validation_fail", "HERALD", _now_ts=t0 + h * 3600)
+
+    # Pass _now_ts=1h after last event so the 48h window covers all 4 seeded events
+    status = bf.get_biofeedback_status(_now_ts=t0 + 21 * 3600)
+
+    check("current_score is float",
+          isinstance(status["current_score"], float), str(status["current_score"]))
+    check("scale_mode is valid string",
+          status["scale_mode"] in ("high", "normal", "throttle"), status["scale_mode"])
+    count_mvf = status["recent_counts"].get("marketing_validation_fail", 0)
+    check("recent_counts[marketing_validation_fail] >= 4",
+          count_mvf >= 4, f"count={count_mvf}")
+    check("active_boosts contains marketing_validation_fail",
+          "marketing_validation_fail" in status["active_boosts"],
+          str(status["active_boosts"]))
+
+
+# ─── T10: get_biofeedback_status() clean after 48h decay window ───────────────
+
+def test_biofeedback_status_clean_after_window() -> None:
+    print("\n[Test 10] get_biofeedback_status() shows no active boosts after 48h+")
+    reset()
+
+    t0 = 1_700_000_000.0
+    for h in [0, 5, 10, 20]:
+        bf.record_event("marketing_validation_fail", "HERALD", _now_ts=t0 + h * 3600)
+
+    # All events are at most t0+20h old; advance 70h → last event is now 50h old,
+    # which is beyond the 48h boost_decay_hours window → count drops to 0.
+    t_future = t0 + 70 * 3600
+
+    status = bf.get_biofeedback_status(_now_ts=t_future)
+
+    # The constraint boost on marketing_validation_fail should be gone;
+    # reward-type boosts (count=0 ≤ rare threshold) are expected to remain.
+    check("marketing_validation_fail NOT in active_boosts after 48h+",
+          "marketing_validation_fail" not in status["active_boosts"],
+          str(status["active_boosts"]))
+    count_mvf = status["recent_counts"].get("marketing_validation_fail", -1)
+    check("marketing_validation_fail count is 0 after window",
+          count_mvf == 0, f"count={count_mvf}")
+
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -331,6 +402,9 @@ def main() -> int:
     test_score_delta_matches_effective_weight()
     test_reward_score_reflects_boost()
     test_regression_existing_ewma()
+    test_boost_log_message()
+    test_biofeedback_status_shows_boost()
+    test_biofeedback_status_clean_after_window()
 
     passed = sum(1 for _, ok, _ in _results if ok)
     total  = len(_results)
