@@ -140,7 +140,9 @@ services:
       - aria-brain
     restart: always
     healthcheck:
-      test: ["CMD", "sh", "-c", "printf 'GET / HTTP/1.0\r\n\r\n' | nc localhost 3000 | grep -q HTTP"]
+      # Use 127.0.0.1 — alpine resolves 'localhost' to ::1 (IPv6) but nginx
+      # listens on 0.0.0.0 (IPv4 only), so the explicit IP is required.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
       interval: 15s
       timeout: 4s
       retries: 3
@@ -171,3 +173,11 @@ services:
       aria-brain:
         condition: service_healthy
     restart: on-failure:3
+    healthcheck:
+      # LiveKit monitoring port is dynamic — check that voice_worker.py is running instead
+      test: ["CMD", "python3", "-c",
+             "import os,glob; procs=[open(f).read() for f in glob.glob('/proc/*/cmdline') if 'voice_worker' in open(f,'rb').read().decode('utf-8','ignore')]; exit(0 if procs else 1)"]
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
