@@ -126,7 +126,7 @@ CAMERA_VIEWS: dict[str, dict] = {
 def _redis_publish(event_type: str, payload: dict) -> None:
     """Fire-and-forget Redis publish. Fails gracefully if Redis is down."""
     try:
-        r = redis.Redis(host="localhost", port=6379, db=0, socket_timeout=1)
+        r = redis.Redis(host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", "6379")), db=0, socket_timeout=1)
         r.publish(REDIS_CHANNEL, json.dumps({"type": event_type, "payload": payload}))
         logger.debug("Published %s → %s", event_type, payload)
     except Exception as exc:
