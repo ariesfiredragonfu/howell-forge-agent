@@ -97,12 +97,24 @@
       "throttle_content": "essential_only"
     },
     "entity_whitelist": [
+      "Quantum Agent Forge",
+      "Agent Forge",
       "Howell Forge",
+      "AI agents",
+      "multi-AI architecture",
+      "agent crew",
+      "SOUL.md",
+      "bytes to atoms",
+      "voice to part",
+      "voice to PCB",
       "custom metalwork",
       "handcrafted",
       "fabrication",
       "steel",
-      "made in USA"
+      "made in USA",
+      "quantum computing",
+      "self-healing",
+      "autonomous operations"
     ]
   },
   "feature_states": {
