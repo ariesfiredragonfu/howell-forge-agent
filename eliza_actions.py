@@ -630,22 +630,29 @@ def _load_entity_whitelist() -> list[str]:
 
 def _entity_match_score(text: str, whitelist: list[str]) -> float:
     """
-    Fraction of whitelist terms that appear in the text (case-insensitive).
-    A term matches if it appears as a substring of the lowercased text.
+    Check whether the text contains at least one whitelist term (case-insensitive).
+
+    Returns 1.0 when ANY whitelist term is found (brand-relevant).
+    Returns 0.0 when NO whitelist term is found.
     Returns 1.0 when whitelist is empty (no constraint to enforce).
+
+    This uses a match-any approach so the result is independent of whitelist
+    size.  The whitelist can grow freely without affecting the threshold.
     """
     if not whitelist:
         return 1.0
     text_lower = text.lower()
-    matches = sum(1 for term in whitelist if term.lower() in text_lower)
-    return matches / len(whitelist)
+    for term in whitelist:
+        if term.lower() in text_lower:
+            return 1.0
+    return 0.0
 
 
 class ValidateFeatureAction(Action):
     """
     Gate any X / social post on:
       1. Feature status = LIVE  (rejects DEV/BETA/DEPRECATED)
-      2. Entity whitelist match ≥ 80%  (guards brand safety / Drift fix)
+      2. Entity whitelist match — at least one on-brand term  (guards brand safety / Drift fix)
 
     On rejection:
       - Raises ValidationError (caller must catch)
@@ -660,11 +667,11 @@ class ValidateFeatureAction(Action):
     name = "VALIDATE_FEATURE"
     description = (
         "Gate Herald posts on feature status (must be LIVE) "
-        "and entity whitelist match (≥80%). "
+        "and entity whitelist match (at least one on-brand term). "
         "Raises ValidationError on any failure."
     )
 
-    ENTITY_MATCH_THRESHOLD: float = 0.80
+    ENTITY_MATCH_THRESHOLD: float = 0.50
 
     def _validate(self, state: AgentState, context: dict) -> bool:
         return bool(context.get("feature_name")) and bool(context.get("proposed_post_text"))

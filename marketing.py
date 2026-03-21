@@ -304,7 +304,7 @@ def fetch_homepage() -> tuple[bool, str, str | None]:
     try:
         req = urllib.request.Request(
             BASE_URL,
-            headers={"User-Agent": "Howell-Forge-Marketing/1.0"},
+            headers={"User-Agent": "Quantum-Agent-Forge-Marketing/1.0"},
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             html = resp.read().decode("utf-8", errors="replace")
