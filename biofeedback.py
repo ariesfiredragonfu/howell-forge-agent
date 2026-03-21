@@ -96,8 +96,13 @@ def _get_redis():
         except Exception:
             _redis_client = None
     try:
+        import os as _os                    # noqa: PLC0415
         import redis as _redis_lib          # noqa: PLC0415
-        r = _redis_lib.Redis(decode_responses=True)
+        r = _redis_lib.Redis(
+            host=_os.getenv("REDIS_HOST", "localhost"),
+            port=int(_os.getenv("REDIS_PORT", "6379")),
+            decode_responses=True,
+        )
         r.ping()
         _redis_client = r
         return _redis_client

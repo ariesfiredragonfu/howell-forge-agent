@@ -313,7 +313,7 @@ async def update_active_fixtures(body: dict):
     # Notify dashboard live
     try:
         import redis as _r
-        rc = _r.Redis(host="localhost", port=6379, db=0, socket_timeout=1)
+        rc = _r.Redis(host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", "6379")), db=0, socket_timeout=1)
         rc.publish("mission_control_events", json.dumps({
             "type": "FIXTURE_UPDATE",
             "payload": body,
@@ -350,7 +350,7 @@ async def ws_events(websocket: WebSocket):
     import redis as _redis_sync
     import threading
 
-    r  = _redis_sync.Redis(host="localhost", port=6379, db=0)
+    r  = _redis_sync.Redis(host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", "6379")), db=0)
     ps = r.pubsub(ignore_subscribe_messages=True)
     ps.subscribe(channel)
 
