@@ -30,8 +30,8 @@ COPY . .
 RUN npm run build
 
 
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM nginx:1.27-alpine AS runtime
+# ── Stage 2: Runtime (non-root) ───────────────────────────────────────────────
+FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
 
 # Copy built assets from Stage 1
 COPY --from=builder /build/dist /usr/share/nginx/html
@@ -44,5 +44,5 @@ RUN rm -f /etc/nginx/conf.d/default.conf.bak
 
 EXPOSE 3000
 
-# nginx runs in the foreground
+# nginx-unprivileged runs as non-root (uid 101) by default
 CMD ["nginx", "-g", "daemon off;"]

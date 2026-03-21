@@ -61,9 +61,12 @@ app = FastAPI(
     version="1.0.0",
 )
 
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+_origins_list = [o.strip() for o in _allowed_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # lock down to React dev server in production
+    allow_origins=_origins_list,
     allow_methods=["*"],
     allow_headers=["*"],
 )

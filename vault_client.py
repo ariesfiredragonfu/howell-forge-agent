@@ -17,7 +17,11 @@ Known "Environment Sync" secret keys:
 WireGuard remote vault:
   If wg0/wg1 interface is up, the vault endpoint is readable from VPN-internal IP.
   Configure: ~/.config/howell-forge-vault/remote.json
-    { "endpoint": "http://10.0.0.1:8200/v1/secret/data/howell-forge", "token": "..." }
+    { "endpoint": "https://10.0.0.1:8200/v1/secret/data/howell-forge", "token": "..." }
+
+  NOTE: HTTP is acceptable ONLY when communicating over a WireGuard tunnel,
+  since the traffic is already encrypted at the network layer. If no WireGuard
+  interface is active, the endpoint MUST use https://.
 """
 
 import json
@@ -140,6 +144,18 @@ def _read_remote_vault(secret_name: str) -> Optional[str]:
         endpoint: str = remote_cfg.get("endpoint", "").rstrip("/")
         token: str = remote_cfg.get("token", "")
         if not endpoint or not token:
+            return None
+
+        # SECURITY: HTTP is only acceptable over WireGuard tunnel.
+        # Warn if using http:// without an active WireGuard interface.
+        if endpoint.startswith("http://") and not is_wireguard_active():
+            import logging
+            logging.getLogger(__name__).warning(
+                "Vault endpoint uses http:// without an active WireGuard "
+                "interface. This is insecure — switch to https:// or "
+                "establish the WireGuard tunnel first. Endpoint: %s",
+                endpoint,
+            )
             return None
         url = f"{endpoint}/{secret_name}"
         req = urllib.request.Request(

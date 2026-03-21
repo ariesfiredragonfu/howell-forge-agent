@@ -306,6 +306,17 @@ def _run_freecad_headless(order_id: str, part_code: str, output_dir: Path) -> di
     Write a runner script, execute with freecadcmd, return paths to outputs.
     Returns: {"step": Path, "stl": Path, "bbox_mm": [x, y, z] or None}
     """
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ SECURITY WARNING: This executes LLM-generated code via freecadcmd. │
+    # │ This is a high-risk operation. In production, this MUST be:        │
+    # │ 1. Run in a sandboxed container with no network access             │
+    # │ 2. Run with restricted filesystem permissions                      │
+    # │    (read-only except output dir)                                   │
+    # │ 3. Subject to a timeout to prevent infinite loops                  │
+    # │ 4. Logged and auditable                                            │
+    # │ TODO: Implement container-based sandboxing for generated code      │
+    # │       execution                                                    │
+    # └──────────────────────────────────────────────────────────────────────┘
     output_dir.mkdir(parents=True, exist_ok=True)
     step_path   = output_dir / "part.step"
     stl_path    = output_dir / "part.stl"
