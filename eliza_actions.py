@@ -630,8 +630,15 @@ def _load_entity_whitelist() -> list[str]:
 
 def _entity_match_score(text: str, whitelist: list[str]) -> float:
     """
-    Fraction of whitelist terms that appear in the text (case-insensitive).
-    A term matches if it appears as a substring of the lowercased text.
+    Check whether the text contains at least one whitelist term (case-insensitive).
+    Returns the fraction of whitelist terms found, but the primary purpose is
+    ensuring brand relevance — at least one term must appear.
+
+    With a large, diverse whitelist (metalwork + AI + quantum), requiring a high
+    fraction of ALL terms is impractical.  The threshold in ValidateFeatureAction
+    should be set low (e.g. 0.05) so that any post mentioning at least one
+    on-brand term passes.
+
     Returns 1.0 when whitelist is empty (no constraint to enforce).
     """
     if not whitelist:
@@ -660,11 +667,11 @@ class ValidateFeatureAction(Action):
     name = "VALIDATE_FEATURE"
     description = (
         "Gate Herald posts on feature status (must be LIVE) "
-        "and entity whitelist match (≥80%). "
+        "and entity whitelist match (≥5% — at least one on-brand term). "
         "Raises ValidationError on any failure."
     )
 
-    ENTITY_MATCH_THRESHOLD: float = 0.80
+    ENTITY_MATCH_THRESHOLD: float = 0.05
 
     def _validate(self, state: AgentState, context: dict) -> bool:
         return bool(context.get("feature_name")) and bool(context.get("proposed_post_text"))
